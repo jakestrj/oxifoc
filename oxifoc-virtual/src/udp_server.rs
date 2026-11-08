@@ -1,241 +1,166 @@
-//! Ergot UDP server — persistent Router stack, one host session at a time.
+//! Virtual CAN-over-UDP server transporting `streaming-protocol` + `nmea` frames.
 //!
-//! Registers a `Router` profile (central, node 1), matching the real device
-//! firmware and the TCP server: the host reaches us as a link-local edge and
-//! the Router assigns it a net_id, so its frames are routed rather than dropped
-//! as spoofed (which happens if both sides are DirectEdge node-2 targets).
+//! Each UDP datagram carries a 10-byte CAN frame:
+//! - Bytes `0..2`: 11-bit standard CAN arbitration ID in little-endian `u16`
+//!   (`NMEA_RX_ARBITRATION_ID = 0x7E5` host -> device,
+//!   `NMEA_TX_ARBITRATION_ID = 0x7ED` device -> host)
+//! - Bytes `2..10`: 8-byte NMEA fast-packet CAN payload
 //!
-//! The stack and its request/response endpoints are created ONCE at startup and
-//! shared across every host session — exactly like real firmware. Each session
-//! only binds a fresh socket and attaches a new interface; on a liveness timeout
-//! the interface goes Down and we rebind. Persistent endpoints mean the host's
-//! first request is always answered immediately (no per-session registration
-//! race — see the TCP server for the full rationale).
-//!
-//! Unlike TCP there is no connection to accept: the socket is bound to a
-//! well-known port and left *unconnected*. ergot's UDP `register_router` learns
-//! the host's address from the first datagram it receives and replies with
-//! `send_to`. After a liveness timeout the interface goes Down; we rebind a
-//! fresh socket (SO_REUSEADDR) and wait for the next host.
+//! The server learns the active host's `SocketAddr` from incoming `0x7E5`
+//! datagrams and directs `0x7ED` telemetry datagrams to that peer until
+//! `LIVENESS_TIMEOUT_MS` elapses without incoming traffic.
 
-use oxifoc_core::icd::LIVENESS_TIMEOUT_MS;
-use oxifoc_core::runtime::streaming::fault_topic_stream;
-use oxifoc_core::virtual_motor::MotorParams;
-
-use crate::detect::detect_server;
 use core::cell::RefCell;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use critical_section::Mutex as CriticalSectionMutex;
-use ergot::exports::mutex::raw_impls::cs::CriticalSectionRawMutex;
-use ergot::interface_manager::interface_impls::tokio_udp::TokioUdpInterface;
-use ergot::interface_manager::profiles::router::Router;
-use ergot::interface_manager::transports::tokio_udp::register_router;
-use ergot::interface_manager::{InterfaceState, LivenessConfig, Profile};
-use ergot::net_stack::ArcNetStack;
-use ergot::toolkits::tokio_stream::WaitQueue;
-use heapless::String;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use tokio::net::UdpSocket;
-use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
-
-use oxifoc_core::foc::fault::FaultRegistry;
-use oxifoc_core::icd::HardwareInfo;
-use oxifoc_core::runtime::servers::run_all_servers_with_config;
-use oxifoc_core::runtime::streaming::fast_telemetry_stream;
+use nmea::nmea_message::{MAX_NMEA_PACKET_SIZE, Message as NmeaMessage};
+use oxifoc_core::foc::fault::{FaultRegistry, StandardFault};
+use oxifoc_core::icd::{
+    LIVENESS_TIMEOUT_MS, NMEA_INTER_FRAME_DELAY_MS, NMEA_RX_ARBITRATION_ID, NMEA_TX_ARBITRATION_ID,
+};
+use oxifoc_core::runtime::servers::{
+    CommsError, MessageSender, NmeaCanReceiver, run_telemetry_publishers, send_messages,
+};
 use oxifoc_core::state::MotorControlState;
-use oxifoc_core::storage::RuntimeConfig;
+use tokio::net::UdpSocket;
+use tracing::{debug, info};
 
-use oxifoc_core::foc::fault::StandardFault;
+use crate::tcp_server::CAN_WIRE_FRAME_LEN;
 
-const ERGOT_MTU: u16 = 2048;
+struct UdpCanSender {
+    socket: Arc<UdpSocket>,
+    peer: Arc<Mutex<Option<SocketAddr>>>,
+}
 
-const _: () = assert!(
-    ERGOT_MTU as usize
-        >= oxifoc_core::types::FAST_BATCH_BYTES + oxifoc_core::types::FAST_BATCH_WIRE_OVERHEAD
-);
+impl MessageSender for UdpCanSender {
+    async fn send_message_internal(&mut self, encoded_buf: &mut [u8]) -> Result<(), CommsError> {
+        if encoded_buf.len() > MAX_NMEA_PACKET_SIZE {
+            return Err(CommsError::NmeaError);
+        }
+        let peer_addr = self.peer.lock().ok().and_then(|g| *g);
+        let Some(target) = peer_addr else {
+            return Ok(());
+        };
+        let mut nmea_msg = NmeaMessage::from_payload(encoded_buf, 0);
+        let id_bytes = NMEA_TX_ARBITRATION_ID.to_le_bytes();
+        while let Some(frame) = nmea_msg.pop_frame() {
+            let mut wire = [0u8; CAN_WIRE_FRAME_LEN];
+            wire[0..2].copy_from_slice(&id_bytes);
+            wire[2..10].copy_from_slice(&frame.bytes);
+            self.socket
+                .send_to(&wire, target)
+                .await
+                .map_err(|_| CommsError::CanError)?;
+            if nmea_msg.num_frames > 1 {
+                tokio::time::sleep(Duration::from_millis(NMEA_INTER_FRAME_DELAY_MS)).await;
+            }
+        }
+        Ok(())
+    }
+}
 
-/// Router sizing for the persistent stack: sessions are strictly sequential
-/// (rebind waits for full teardown), so one live interface at a time — a few
-/// slots give headroom and freed net_ids are recycled. No downstream seed routes.
-const ROUTER_SLOTS: usize = 4;
-const ROUTER_SEEDS: usize = 0;
-type RouterStack = ArcNetStack<
-    CriticalSectionRawMutex,
-    Router<TokioUdpInterface, StdRng, ROUTER_SLOTS, ROUTER_SEEDS>,
->;
-
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     port: u16,
     foc_freq_hz: u32,
-    max_current_a: f32,
-    vbus: f32,
-    motor_params: MotorParams,
     state_mutex: &'static CriticalSectionMutex<RefCell<MotorControlState>>,
     fault_registry: &'static FaultRegistry<StandardFault>,
-    runtime_config: &'static CriticalSectionMutex<RefCell<RuntimeConfig>>,
 ) -> Result<()> {
     let bind_addr = format!("0.0.0.0:{port}");
-    info!("UDP Router on {bind_addr}");
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&bind_addr.parse::<SocketAddr>()?.into())?;
+    let socket = Arc::new(UdpSocket::from_std(sock.into())?);
+    info!("CAN-over-UDP server listening on {bind_addr}");
 
-    // Persistent Router stack — created once, shared across all sessions.
-    let stack: RouterStack =
-        ArcNetStack::new_with_profile(Router::new(StdRng::seed_from_u64(0x0F0C_5EED)));
+    // Spawn persistent background telemetry publishers (slow, fast, fault watches).
+    tokio::spawn(run_telemetry_publishers::<StandardFault, crate::TokioTimer>(
+        state_mutex,
+        fault_registry,
+        foc_freq_hz,
+    ));
 
-    // Device info — constant for the life of the process.
-    let device_info = {
-        let mut hw: String<32> = String::new();
-        let mut sw: String<32> = String::new();
-        let mut mcu: String<32> = String::new();
-        let mut uuid: String<32> = String::new();
-        let _ = hw.push_str("Virtual-BLDC");
-        let _ = sw.push_str("oxifoc-virtual-0.1.0");
-        let _ = mcu.push_str("x86_64 (virtual)");
-        let _ = uuid.push_str("00000000-virtual");
-        HardwareInfo {
-            bootstrap_magic: oxifoc_core::types::ICD_BOOTSTRAP_MAGIC,
-            proto_version: oxifoc_core::types::ICD_PROTO_VERSION,
-            capabilities: 0,
-            reserved: [0; 8],
-            hw,
-            sw,
-            mcu,
-            uuid,
-            foc_freq_hz,
-            max_current_a,
-            calib: crate::VIRTUAL_CALIB,
-        }
-    };
+    let peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let boot_instant = Instant::now();
+    let last_rx_ms = Arc::new(AtomicU64::new(0));
 
-    // Persistent request/response servers: bound once, always ready — the
-    // host's first request is never racing endpoint registration.
+    // Outbound CAN TX task.
     tokio::spawn({
-        let endpoints = stack.endpoints();
+        let socket = socket.clone();
+        let peer = peer.clone();
         async move {
-            // Box::pin: ~5 KB future; the 2 KB large_futures threshold is tuned
-            // for firmware, on the host we just heap it.
-            Box::pin(run_all_servers_with_config::<_, _, crate::TokioTimer>(
-                endpoints,
-                device_info,
-                state_mutex,
-                fault_registry,
-                runtime_config,
-                foc_freq_hz,
-                max_current_a,
-                true,
-            ))
-            .await;
-        }
-    });
-    tokio::spawn({
-        let endpoints = stack.endpoints();
-        async move {
-            detect_server(endpoints, vbus, max_current_a, foc_freq_hz, motor_params).await;
-        }
-    });
-    // Well-known socket-query handler: answers the host's connect-time
-    // address resolution (same service the firmware runs).
-    tokio::spawn({
-        let services = stack.services();
-        async move {
-            services.socket_query_handler::<4>().await;
+            let mut sender = UdpCanSender { socket, peer };
+            send_messages(&mut sender).await;
         }
     });
 
-    let mut prev_conn_token: Option<CancellationToken> = None;
-    loop {
-        // Bind a fresh *unconnected* socket each session. SO_REUSEADDR lets us
-        // rebind the same port after the previous session's workers exit.
-        let socket = {
-            let sock = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )?;
-            sock.set_reuse_address(true)?;
-            sock.set_nonblocking(true)?;
-            sock.bind(&bind_addr.parse::<std::net::SocketAddr>()?.into())?;
-            UdpSocket::from_std(sock.into())?
-        };
-        info!("Waiting for host...");
-
-        // Stop the previous session's telemetry tasks before attaching the new
-        // interface (single-consumer fast-telemetry bbqueue — see TCP server).
-        if let Some(prev) = prev_conn_token.take() {
-            prev.cancel();
-        }
-
-        let state_notify = Arc::new(WaitQueue::new());
-        // No turbofish: M/SS (and CC on branches that have it) infer from the
-        // `RouterStack` type alias, keeping this portable across ergot branches.
-        let ident = register_router(
-            stack.clone(),
-            socket,
-            ERGOT_MTU,
-            32768,
-            Some(LivenessConfig {
-                timeout_ms: LIVENESS_TIMEOUT_MS,
-            }),
-            Some(state_notify.clone()),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("UDP router interface registration failed"))?;
-
-        // Cancel token for this session's telemetry.
-        let conn_token = CancellationToken::new();
-        prev_conn_token = Some(conn_token.clone());
-
-        // Fast telemetry streaming. Broadcasts are gated by the host enabling
-        // streaming; until the Router has learned the peer, frames simply queue
-        // in the tx worker, so no Active-state wait is needed.
-        tokio::spawn({
-            let stack = stack.clone();
-            let token = conn_token.clone();
-            async move {
-                tokio::select! {
-                    _ = token.cancelled() => {}
-                    _ = fast_telemetry_stream::<_, crate::TokioTimer>(stack.clone(), foc_freq_hz) => {}
-                    _ = fault_topic_stream::<_, _, crate::TokioTimer>(stack, fault_registry) => {}
+    // Liveness monitor task.
+    tokio::spawn({
+        let peer = peer.clone();
+        let last_rx_ms = last_rx_ms.clone();
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                let has_peer = peer.lock().ok().is_some_and(|g| g.is_some());
+                if has_peer {
+                    let elapsed = (boot_instant.elapsed().as_millis() as u64)
+                        .saturating_sub(last_rx_ms.load(Ordering::Relaxed));
+                    if elapsed > LIVENESS_TIMEOUT_MS {
+                        if let Ok(mut g) = peer.lock() {
+                            *g = None;
+                        }
+                        critical_section::with(|cs| {
+                            state_mutex.borrow(cs).borrow_mut().set_link_inactive();
+                        });
+                    }
                 }
             }
-        });
-
-        // Block until the host goes quiet: the interface is Active from
-        // registration (net_id assigned), and on a liveness timeout ergot sets
-        // it Down then *deregisters* it (state becomes None), so treat anything
-        // no longer Active as a disconnect (matching Down specifically would
-        // race the deregister).
-        loop {
-            let active = stack.manage_profile(|im| {
-                matches!(
-                    im.interface_state(ident),
-                    Some(InterfaceState::Active { .. })
-                )
-            });
-            if !active {
-                break;
-            }
-            let _ = state_notify.wait().await;
         }
-        warn!("Host disconnected, stopping session tasks");
-        critical_section::with(|cs| state_mutex.borrow(cs).borrow_mut().set_link_inactive());
-        conn_token.cancel();
+    });
 
-        info!("UDP session ended, waiting for workers to exit...");
-
-        // Wait for the interface to fully tear down before rebinding the port.
-        loop {
-            let state = stack.manage_profile(|im| im.interface_state(ident));
-            if matches!(state, Some(InterfaceState::Down) | None) {
-                break;
-            }
-            let _ = state_notify.wait().await;
+    // Inbound CAN RX loop.
+    let mut nmea_rx = NmeaCanReceiver::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let (len, src_addr) = socket.recv_from(&mut buf).await?;
+        if len != CAN_WIRE_FRAME_LEN {
+            continue;
         }
-
-        info!("Ready for next connection");
+        let arb_id = u16::from_le_bytes([buf[0], buf[1]]);
+        if arb_id == NMEA_RX_ARBITRATION_ID {
+            let mut peer_changed = false;
+            if let Ok(mut g) = peer.lock()
+                && *g != Some(src_addr)
+            {
+                *g = Some(src_addr);
+                peer_changed = true;
+            }
+            if peer_changed {
+                nmea_rx.reset();
+                info!("CAN-over-UDP learned peer: {src_addr}");
+            }
+            last_rx_ms.store(
+                boot_instant.elapsed().as_millis() as u64,
+                Ordering::Relaxed,
+            );
+            if let Err(e) = nmea_rx.handle_frame(
+                &buf[2..10],
+                state_mutex,
+                fault_registry,
+                foc_freq_hz,
+            ) {
+                debug!("CAN-over-UDP RX decode error from {src_addr}: {e:?}");
+            }
+        }
     }
 }

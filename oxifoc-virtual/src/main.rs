@@ -1,4 +1,3 @@
-mod detect;
 mod sim;
 mod storage;
 mod tcp_server;
@@ -17,7 +16,7 @@ impl Timer for TokioTimer {
 }
 
 use clap::Parser;
-use oxifoc_core::storage::{CONFIG_LOADED, MotorParamsConfig, RuntimeConfig};
+use oxifoc_core::storage::{CONFIG_LOADED, MotorParamsConfig};
 use oxifoc_core::timer::Timer;
 use oxifoc_core::virtual_motor::MotorParams;
 use tracing_subscriber::EnvFilter;
@@ -37,22 +36,6 @@ pub const VIRTUAL_CALIB: oxifoc_core::types::BoardCalib = oxifoc_core::types::Bo
     vbus_divider_ratio: 10.39,
 };
 
-// Runtime config shared between config server and simulation
-static RUNTIME_CONFIG: critical_section::Mutex<core::cell::RefCell<RuntimeConfig>> =
-    critical_section::Mutex::new(core::cell::RefCell::new(RuntimeConfig {
-        motor_params: None,
-        hall_calibration: None,
-        dc_offsets: None,
-        current_limits: None,
-        voltage_limits: None,
-        pwm_config: None,
-        pi_gains: None,
-        hall_tuning: None,
-        failsafe: None,
-        velocity: None,
-        derating: None,
-    }));
-
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum Transport {
     Tcp,
@@ -61,7 +44,7 @@ enum Transport {
 
 #[derive(Parser)]
 #[command(name = "oxifoc-virtual")]
-#[command(about = "Virtual motor controller with ergot protocol")]
+#[command(about = "Virtual motor controller with streaming-protocol and NMEA over CAN")]
 struct Args {
     /// Transport protocol
     #[arg(short, long, default_value = "tcp")]
@@ -104,8 +87,6 @@ fn config_from_motor_params(params: MotorParams, max_current_a: f32) -> MotorPar
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // The virtual backend returns deterministic offset diagnostics directly;
-    // it has no hardware boot-calibration phase to gate config/detection on.
     oxifoc_core::state::BOOT_CURRENT_OFFSET_PENDING
         .store(false, core::sync::atomic::Ordering::Release);
     tracing_subscriber::fmt()
@@ -126,8 +107,6 @@ async fn main() -> anyhow::Result<()> {
         args.max_current,
     );
 
-    // One motor parameter set for both the live sim and the detection
-    // backend — CLI flags override the defaults here, nowhere else.
     let motor_params = MotorParams {
         pole_pairs: args.pole_pairs,
         ..Default::default()
@@ -136,20 +115,18 @@ async fn main() -> anyhow::Result<()> {
     // Storage worker uses !Send futures (sequential-storage internals),
     // so run it on a dedicated thread with a LocalSet.
     std::thread::spawn(|| {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
-        rt.block_on(storage::storage_worker());
+        {
+            rt.block_on(storage::storage_worker());
+        }
     });
 
     let mut loaded_config = CONFIG_LOADED.wait().await;
     if loaded_config.motor_params.is_none() {
         loaded_config.motor_params = Some(config_from_motor_params(motor_params, args.max_current));
     }
-    critical_section::with(|cs| {
-        *RUNTIME_CONFIG.borrow(cs).borrow_mut() = loaded_config.clone();
-    });
     tracing::info!("Config loaded from mock flash");
 
     // Spawn simulation loop
@@ -168,32 +145,10 @@ async fn main() -> anyhow::Result<()> {
     // Run server (blocks on accept/recv loop)
     match args.transport {
         Transport::Tcp => {
-            tcp_server::run(
-                args.port,
-                args.foc_freq,
-                args.max_current,
-                args.vbus,
-                motor_params,
-                &STATE,
-                &FAULT_REGISTRY,
-                &RUNTIME_CONFIG,
-            )
-            .await
+            tcp_server::run(args.port, args.foc_freq, &STATE, &FAULT_REGISTRY).await
         }
         Transport::Udp => {
-            // Box::pin: ~6 KB future; the 2 KB large_futures threshold is
-            // tuned for firmware, on the host we just heap it.
-            Box::pin(udp_server::run(
-                args.port,
-                args.foc_freq,
-                args.max_current,
-                args.vbus,
-                motor_params,
-                &STATE,
-                &FAULT_REGISTRY,
-                &RUNTIME_CONFIG,
-            ))
-            .await
+            udp_server::run(args.port, args.foc_freq, &STATE, &FAULT_REGISTRY).await
         }
     }
 }

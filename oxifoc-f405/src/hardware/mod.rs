@@ -12,7 +12,7 @@ use embassy_stm32::gpio::{Level, Output, Speed};
 #[cfg(feature = "board-vesc6-mk5")]
 pub use resources::BoardCtrlResources;
 pub use resources::{
-    AssignedResources, DrvResources, HallResources, MotorResources, UartResources,
+    AssignedResources, CanResources, DrvResources, HallResources, MotorResources,
 };
 
 /// Board-control outputs that must stay driven for the whole run — dropping

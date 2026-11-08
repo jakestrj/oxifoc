@@ -29,8 +29,11 @@ sequential-storage = { version = "8.0", default-features = false, features = ["p
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 postcard-schema = { version = "0.2.5", features = ["derive", "heapless-v0_9"] }
 
-# Ergot protocol framework (for icd feature)
-ergot = { workspace = true, optional = true }
+# Protobuf + streaming-protocol + NMEA over CAN
+femtopb = { version = "0.8.0", default-features = false }
+femtopb-derive = { version = "0.8.0", default-features = false }
+streaming-protocol = { git = "https://github.com/jakestrj/streaming-protocol", rev = "157cf63", optional = true }
+nmea = { git = "https://github.com/jakestrj/nmea", rev = "f882d1d", optional = true }
 
 # Async runtime support (for runtime feature)
 embassy-time = { version = "0.5.1", optional = true, git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
@@ -49,6 +52,10 @@ bitflags = { version = "2", default-features = false, features = ["serde"] }
 embedded-storage-async = { version = "0.4", optional = true }
 cortex-m = { version = "0.7.8", optional = true }
 dsp-fixedpoint = { version = "0.2.1", default-features = false, optional = true }
+
+[build-dependencies]
+anyhow = "1.0"
+femtopb-build = { version = "0.8.0", default-features = false }
 
 [dev-dependencies]
 critical-section = { version = "1.2", features = ["std"] }
@@ -111,13 +118,10 @@ hfi-detect = ["detection", "dep:microfft"]
 # only (overlay against a bench LCR sweep).
 impedance-sweep = ["hfi-detect"]
 
-# Interface Control Document - ergot endpoints and wire types
-icd = ["dep:ergot"]
+# Interface Control Document - streaming-protocol + NMEA wire types
+icd = ["dep:streaming-protocol", "dep:nmea"]
 
-# Delivery semantics — typed at-most/at-least/effectively-once ladder over ergot.
-# Contract + pure retry policy + server-side dedup. The client driver is generic
-# over `timer::Timer`, so it works on host (tokio) and device (embassy) alike.
-# embassy-futures is used only for its runtime-agnostic `select` (per-attempt timeout).
+# Delivery semantics (retained feature alias for icd + embassy-futures)
 delivery = ["icd", "dep:embassy-futures"]
 
 # FOC algorithms (transforms, SVPWM, PI controllers, etc.)

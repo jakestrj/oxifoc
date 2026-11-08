@@ -11,14 +11,7 @@ test = false
 bench = false
 
 [features]
-# ergot transports. USB + UART are the production interfaces (both default-on,
-# run simultaneously). transport-rtt adds an ergot-over-RTT interface (defmt
-# shares RTT channel 0) for throughput diagnostics — it pulls in the ergot `rtt`
-# feature and the synthetic telemetry generator (this board has no FOC ISR).
-default = ["transport-usb", "transport-uart"]
-transport-usb = []
-transport-uart = []
-transport-rtt = ["ergot/rtt"]
+default = []
 
 [dependencies]
 # Embassy dependencies (main branch with async flash support for G4)
@@ -27,7 +20,6 @@ embassy-futures = { version = "0.1.2", features = ["defmt"], git = "https://gith
 embassy-stm32 = { version = "0.6.0", features = ["stm32g474re", "time-driver-tim5", "unstable-pac", "dual-bank", "defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 embassy-sync = { version = "0.8.0", features = ["defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 embassy-time = { version = "0.5.1", features = ["tick-hz-32_768", "defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
-embassy-usb = { version = "0.6.0", features = ["defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 
 # Cortex-M dependencies
 cortex-m = { version = "0.7.8", features = ["inline-asm", "critical-section-single-core"] }
@@ -44,17 +36,11 @@ postcard-schema = "0.2.5"
 # Synchronization
 mutex = "1.0.2"
 
-# Local dependencies
-# runtime feature includes icd (endpoints) and types (shared structs)
+# Local dependencies + CAN protocol
 oxifoc-core = { path = "../oxifoc-core", features = ["runtime", "defmt", "storage", "embassy", "cordic", "embassy-hal", "hfi", "hfi-detect", "isr-speed"] }
-ergot = { git = "https://github.com/okhsunrog/ergot", rev = "e93b03b", default-features = false, features = [
-    "embassy-usb-v0_6",
-    "embedded-io-async-v0_7",
-    "nostd-seed-router",
-    "embassy-time",
-    "disable-cache-padding",
-    "defmt-sink-rtt",
-] }
+femtopb = { version = "0.8.0", default-features = false }
+streaming-protocol = { git = "https://github.com/jakestrj/streaming-protocol", rev = "157cf63" }
+nmea = { git = "https://github.com/jakestrj/nmea", rev = "f882d1d" }
 
 static_cell = "2.1"
 assign-resources = "0.5.0"
@@ -67,13 +53,10 @@ sequential-storage = { version = "8.0", features = ["postcard", "defmt"] }
 embedded-storage-async = "0.4"
 embassy-embedded-hal = { version = "0.6.0", features = ["defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 postcard = { version = "1.1", features = ["use-defmt"] }
-rtt-target = "0.6"
+rtt-target = { version = "0.6", features = ["defmt"] }
 
-# Keep Embassy types used through ergot on the same main-branch revision as
-# embassy-stm32.
 [patch.crates-io]
 embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
-embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 
 [profile.dev]
 debug = true

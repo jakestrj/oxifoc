@@ -123,33 +123,9 @@ pub const PWM_CONFIG: MotorPwmConfig = MotorPwmConfig::new().with_dead_time_ns(3
 pub const CPU_HZ: u32 = 168_000_000;
 
 // ============================================================================
-// Protocol Configuration
+// Protocol Configuration (CAN + NMEA + streaming-protocol)
 // ============================================================================
 
-/// Size of outgoing packet queue for ergot over USB (framed)
-pub const USB_OUT_QUEUE_SIZE: usize = 4096;
-
-/// Size of outgoing packet queue for ergot over UART (COBS stream)
-pub const UART_OUT_QUEUE_SIZE: usize = 4096;
-
-/// Size of outgoing packet queue for ergot over RTT (COBS stream)
-pub const RTT_OUT_QUEUE_SIZE: usize = 4096;
-
-/// Maximum packet size for ergot framing
-pub const MAX_PACKET_SIZE: usize = 512;
-
-// This value is also every interface's TX MTU: a full fast-telemetry batch
-// plus wire overhead must fit or full batches silently fail to broadcast.
-const _: () = assert!(
-    MAX_PACKET_SIZE
-        >= oxifoc_core::types::FAST_BATCH_BYTES + oxifoc_core::types::FAST_BATCH_WIRE_OVERHEAD
-);
-
-/// UART baud rate for USART3 (Cheap FOCer 2 external connector)
-pub const UART_BAUD: u32 = 921_600;
-
-/// UART TX buffer size
-pub const UART_TX_BUF_LEN: usize = 2048;
-
-/// UART RX buffer size
-pub const UART_RX_BUF_LEN: usize = 512;
+pub use oxifoc_core::icd::{
+    CAN_BITRATE, NMEA_INTER_FRAME_DELAY_MS, NMEA_RX_ARBITRATION_ID, NMEA_TX_ARBITRATION_ID,
+};

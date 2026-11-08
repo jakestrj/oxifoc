@@ -34,7 +34,7 @@ mod transport;
 #[allow(unused_imports)]
 use hardware::BoardCtrlResources;
 #[allow(unused_imports)]
-use hardware::{AssignedResources, DrvResources, HallResources, MotorResources, UartResources};
+use hardware::{AssignedResources, CanResources, DrvResources, HallResources, MotorResources};
 use motor::MotorPwm;
 
 // Define platform state with our fault type
@@ -72,32 +72,24 @@ async fn main(spawner: Spawner) {
     // ISR preempt immediately.
     {
         use embassy_stm32::interrupt::{InterruptExt, Priority};
-        interrupt::OTG_FS.set_priority(Priority::P5); // USB transport
-        interrupt::USART3.set_priority(Priority::P5); // UART transport
+        interrupt::CAN1_TX.set_priority(Priority::P5);
+        interrupt::CAN1_RX0.set_priority(Priority::P5);
+        interrupt::CAN1_RX1.set_priority(Priority::P5);
+        interrupt::CAN1_SCE.set_priority(Priority::P5);
         interrupt::EXTI9_5.set_priority(Priority::P4); // DRV8301 nFAULT
-        interrupt::RNG.set_priority(Priority::P6);
         interrupt::TIM2.set_priority(Priority::P6); // embassy time driver
     }
 
-    // ========== STEP 2: Initialize RNG + Ergot Router Stack ==========
-    // Stack first (no defmt), then the RTT/defmt sink so an ergot-over-RTT
-    // interface (transport-rtt) can register on it in one rtt_init!.
-    let rng = embassy_stm32::rng::Rng::new(p.RNG, transport::RngIrqs);
-    let stack = transport::init_stack(rng);
+    // ========== STEP 2: Initialize defmt logging over RTT ==========
+    rtt_target::rtt_init_defmt!();
 
-    // ========== STEP 3: Initialize defmt logging (RTT + network) ==========
-    #[cfg(not(feature = "transport-rtt"))]
-    let defmt_consumer = transport::init_defmt();
-    #[cfg(feature = "transport-rtt")]
-    let (defmt_consumer, rtt_transport, rtt_ident) = transport::init_rtt(stack);
-
-    // ========== STEP 4: Initialize LEDs ==========
+    // ========== STEP 3: Initialize LEDs ==========
     let green_led = hardware::peripherals::init_green_led(p.PB0);
     let red_led = hardware::peripherals::init_red_led(p.PB1);
     spawner.spawn(defmt::unwrap!(heartbeat(green_led)));
     spawner.spawn(defmt::unwrap!(fault_led(red_led)));
 
-    // ========== STEP 5: Split Hardware Resources ==========
+    // ========== STEP 4: Split Hardware Resources ==========
     let r = split_resources!(p);
 
     // MK5: latch the power button (PC5) and enable the current/phase-sense
@@ -106,62 +98,11 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "board-vesc6-mk5")]
     let _board_ctrl = hardware::board_early_init(r.board_ctrl);
 
-    // ========== STEP 6: Initialize USB + UART transports ==========
-    #[cfg(feature = "transport-usb")]
-    let (usb_transport, usb_ident) = transport::init_usb(stack, p.USB_OTG_FS, p.PA12, p.PA11);
-    #[cfg(feature = "transport-uart")]
-    let (uart_transport, uart_ident) =
-        transport::init_uart(stack, r.uart.usart3, r.uart.pb10, r.uart.pb11);
-
-    // Collect the idents of every registered interface for the state monitor.
-    let mut idents: heapless::Vec<u8, 3> = heapless::Vec::new();
-    #[cfg(feature = "transport-rtt")]
-    let _ = idents.push(rtt_ident);
-    #[cfg(feature = "transport-uart")]
-    let _ = idents.push(uart_ident);
-    #[cfg(feature = "transport-usb")]
-    let _ = idents.push(usb_ident);
-
-    // ========== STEP 7: Spawn Transport and Protocol Tasks ==========
-    #[cfg(feature = "transport-rtt")]
-    {
-        spawner.spawn(defmt::unwrap!(protocol::servers::run_rtt_rx(
-            rtt_transport.rx_worker,
-            protocol::RTT_RECV_BUF.init_with(|| [0u8; config::MAX_PACKET_SIZE]),
-            protocol::RTT_SCRATCH_BUF.init_with(|| [0u8; 64]),
-        )));
-        spawner.spawn(defmt::unwrap!(protocol::servers::run_rtt_tx(
-            rtt_transport.tx
-        )));
-    }
-    #[cfg(feature = "transport-usb")]
-    {
-        spawner.spawn(defmt::unwrap!(protocol::servers::usb_task(
-            usb_transport.usb_dev
-        )));
-        spawner.spawn(defmt::unwrap!(protocol::servers::run_usb_rx(
-            usb_transport.rx_worker,
-            protocol::USB_RECV_BUF.init_with(|| [0u8; config::MAX_PACKET_SIZE]),
-        )));
-        spawner.spawn(defmt::unwrap!(protocol::servers::run_usb_tx(
-            usb_transport.ep_in,
-            transport::USB_OUTQ.framed_consumer()
-        )));
-    }
-    #[cfg(feature = "transport-uart")]
-    {
-        spawner.spawn(defmt::unwrap!(protocol::servers::run_uart_rx(
-            uart_transport.rx_worker,
-            protocol::UART_RECV_BUF.init_with(|| [0u8; config::MAX_PACKET_SIZE]),
-            protocol::UART_SCRATCH_BUF.init_with(|| [0u8; 64]),
-        )));
-        spawner.spawn(defmt::unwrap!(protocol::servers::run_uart_tx(
-            uart_transport.tx,
-            stack,
-            uart_ident
-        )));
-    }
-    protocol::servers::spawn_servers(&spawner, stack, &idents, defmt_consumer);
+    // ========== STEP 5: Initialize CAN1 Transport & Protocol Tasks ==========
+    let (can_tx, can_rx) = transport::init_can(r.can).await;
+    spawner.spawn(defmt::unwrap!(protocol::servers::can_comm(can_rx, can_tx)));
+    spawner.spawn(defmt::unwrap!(protocol::servers::telemetry_task()));
+    spawner.spawn(defmt::unwrap!(protocol::servers::liveness_task()));
 
     // ========== STEP 8: Initialize Persistent Storage ==========
     let flash = embassy_stm32::flash::Flash::new_blocking(p.FLASH);
@@ -220,13 +161,13 @@ async fn main(spawner: Spawner) {
     defmt::info!(
         "F405 board=CF2: PWM PA8/PA9/PA10 + PB13/14/15, DRV8301 EN_GATE=PB5, nFAULT=PB7, \
          SPI3 CS/SCK/MISO/MOSI=PC9/PC10/PC11/PC12, halls=PC6/7/8, ADC currents PC0-2, VBUS PC3, \
-         USART3 TX=PB10 RX=PB11"
+         CAN1 RX=PB8 TX=PB9"
     );
     #[cfg(feature = "board-vesc6-mk5")]
     defmt::info!(
         "F405 board=VESC6_MK5: PWM PA8/PA9/PA10 + PB13/14/15, DRV8301 EN_GATE=PB5, nFAULT=PB7, \
          bit-bang SPI CS/SCK/MISO/MOSI=PC9/PC10/PB3/PB4, halls=PC6/7/8, ADC currents PC0-2 \
-         (phase shunts), VBUS PC3, USART3 TX=PB10 RX=PB11, latch PC5, filters PD2/PC13"
+         (phase shunts), VBUS PC3, CAN1 RX=PB8 TX=PB9, latch PC5, filters PD2/PC13"
     );
     defmt::info!(
         "Board config: shunt={=f32}Ω, amp_gain={=f32} V/V, vbus_ratio={=f32}:1, faults={}",

@@ -1,43 +1,30 @@
-//! Protocol layer for ergot communication and device management
+//! Protocol layer for `streaming-protocol` + `nmea` communication over CAN.
 
 pub mod servers;
 
 use core::sync::atomic::{AtomicU8, Ordering};
-use static_cell::StaticCell;
 
-use crate::config::MAX_PACKET_SIZE;
-
-/// Buffer for RX workers
-pub static USB_RECV_BUF: StaticCell<[u8; MAX_PACKET_SIZE]> = StaticCell::new();
-pub static UART_RECV_BUF: StaticCell<[u8; MAX_PACKET_SIZE]> = StaticCell::new();
-
-/// Scratch buffer for COBS decoding (UART only)
-pub static UART_SCRATCH_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-
-/// RTT RX worker buffers (ergot over RTT)
-#[cfg(feature = "transport-rtt")]
-pub static RTT_RECV_BUF: StaticCell<[u8; MAX_PACKET_SIZE]> = StaticCell::new();
-#[cfg(feature = "transport-rtt")]
-pub static RTT_SCRATCH_BUF: StaticCell<[u8; 64]> = StaticCell::new();
-
-// ========== Device State Management ==========
-
-/// Device operational state
+/// High-level device states for LED status indication
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum DeviceState {
+    /// Device is booting / initializing
     Boot = 0,
+    /// Waiting for CAN link / first command
     WaitingLink = 1,
+    /// Active communication link established
     Linked = 2,
+    /// Error state (fault active)
     Error = 3,
 }
 
 static DEVICE_STATE: AtomicU8 = AtomicU8::new(DeviceState::Boot as u8);
 
-pub fn set_device_state(s: DeviceState) {
-    DEVICE_STATE.store(s as u8, Ordering::Relaxed);
+/// Set current device state
+pub fn set_device_state(state: DeviceState) {
+    DEVICE_STATE.store(state as u8, Ordering::Relaxed);
 }
 
+/// Get current device state
 pub fn get_device_state() -> DeviceState {
     match DEVICE_STATE.load(Ordering::Relaxed) {
         0 => DeviceState::Boot,

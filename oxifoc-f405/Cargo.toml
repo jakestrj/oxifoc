@@ -11,7 +11,7 @@ test = false
 bench = false
 
 [features]
-default = ["transport-usb", "transport-uart", "board-cf2"]
+default = ["board-cf2"]
 # Exactly one board feature must be enabled (compile_error in main.rs).
 # Cheap FOCer 2 / Simple FOCer 2: DRV8301 on hardware SPI3, low-side shunts,
 # amp gain 10 V/V.
@@ -21,13 +21,6 @@ board-cf2 = []
 # shutdown latch PC5, current/phase filter enables PD2/PC13.
 # See docs/hw/vesc6-mk5.md.
 board-vesc6-mk5 = []
-# USB bulk endpoints via embassy-usb; defmt over RTT for debugging.
-transport-usb = []
-# UART on USART3 (PB10 TX / PB11 RX) for Cheap FOCer 2
-transport-uart = []
-# ergot over RTT channel 1 (defmt shares ch0). Diagnostic transport — high-rate
-# telemetry over the debug probe; adds a third interface alongside USB/UART.
-transport-rtt = ["ergot/rtt"]
 # Observer-internals fast-frame mapping (erpm<-PLL, vd<-frame gap,
 # vq<-readiness err signed by trust; see oxifoc-core `obs-debug-telem`).
 # Debug builds only.
@@ -40,7 +33,6 @@ embassy-futures = { version = "0.1.2", features = ["defmt"], git = "https://gith
 embassy-stm32 = { version = "0.6.0", features = ["stm32f405rg", "time-driver-tim2", "unstable-pac", "exti", "defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 embassy-sync = { version = "0.8.0", features = ["defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 embassy-time = { version = "0.5.1", features = ["tick-hz-32_768", "defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
-embassy-usb = { version = "0.6.0", features = ["defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 
 cortex-m = { version = "0.7.8", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.6"
@@ -66,28 +58,19 @@ embedded-storage-async = "0.4"
 embassy-embedded-hal = { version = "0.6.0", features = ["defmt"], git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 postcard = { version = "1.1", features = ["use-defmt"] }
 
-# Local crates
+# Local crates + CAN protocol
 oxifoc-core = { path = "../oxifoc-core", features = ["defmt", "runtime", "storage", "embassy", "embassy-hal", "delivery", "hfi", "hfi-detect", "isr-speed", "isr-profiling"] }
-ergot = { git = "https://github.com/okhsunrog/ergot", rev = "e93b03b", default-features = false, features = [
-    "embassy-usb-v0_6",
-    "embedded-io-async-v0_7",
-    "nostd-seed-router",
-    "embassy-time",
-    "disable-cache-padding",
-    "defmt-sink-rtt",
-    "defmt-sink-network",
-] }
-rtt-target = "0.6"
+femtopb = { version = "0.8.0", default-features = false }
+streaming-protocol = { git = "https://github.com/jakestrj/streaming-protocol", rev = "157cf63" }
+nmea = { git = "https://github.com/jakestrj/nmea", rev = "f882d1d" }
+rtt-target = { version = "0.6", features = ["defmt"] }
 libm = "0.2.16"
 serde = { version = "1.0.229", default-features = false }
 embedded-hal = "1.0.0"
 bitbang-hal-ng = { version = "0.5.0", features = ["cortex-m"] }
 
-# Keep Embassy types used through ergot on the same main-branch revision as
-# embassy-stm32.
 [patch.crates-io]
 embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
-embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
 
 [profile.dev]
 debug = true

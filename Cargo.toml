@@ -2,13 +2,13 @@
 resolver = "2"
 members = [
     "oxifoc-core",
-    "oxifoc-host-lib",
-    "oxifoc-host-cli",
     "slint-wgpu-plot",
-    "oxifoc-host-slint",
     "oxifoc-virtual",
 ]
 exclude = [
+    "oxifoc-host-lib",
+    "oxifoc-host-cli",
+    "oxifoc-host-slint",
     "oxifoc-g474",    # Different toolchain (thumbv7em-none-eabihf)
     "oxifoc-f405",    # Different toolchain (thumbv7em-none-eabihf)
     "oxifoc-bridge",  # Different toolchain (riscv32imac-unknown-none-elf, ESP32-C6)
@@ -62,9 +62,11 @@ oxifoc-core = { path = "oxifoc-core" }
 # Git deps are pinned to revs for reproducible builds (CI runs with --locked).
 # To bump: update the rev here AND in the excluded device crates' Cargo.toml
 # (oxifoc-g474/f405/bridge/remote), then refresh all Cargo.lock files.
-# ergot rev = upstream main HEAD 2026-08-12 (edge_link_local ctor +
-# revert-to-link-local liveness policy + the #217 soundness batch)
-ergot = { git = "https://github.com/okhsunrog/ergot", rev = "e93b03b" }
+femtopb = { version = "0.8.0", default-features = false }
+femtopb-derive = { version = "0.8.0", default-features = false }
+femtopb-build = { version = "0.8.0", default-features = false }
+streaming-protocol = { git = "https://github.com/jakestrj/streaming-protocol", rev = "157cf63" }
+nmea = { git = "https://github.com/jakestrj/nmea", rev = "f882d1d" }
 tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

@@ -35,4 +35,9 @@ assign_resources! {
     storage: StorageResources {
         flash: FLASH,
     }
+    can: CanResources {
+        can: FDCAN1,
+        rx: PB8,   // FDCAN1 RX
+        tx: PB9,   // FDCAN1 TX
+    }
 }

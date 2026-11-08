@@ -56,14 +56,8 @@ pub fn init_clock() -> Peripherals {
         // ADC clock source: use SYSCLK (170MHz) - will be needed for motor control
         config.rcc.mux.adc12sel = mux::Adcsel::Sys;
 
-        // Note: LPUART1 clock is configured automatically by Embassy based on the
-        // peripheral clock. For 115200 baud, the default PCLK is sufficient.
-
-        // USB 48MHz clock: enable HSI48 with CRS synchronization from USB SOF frames
-        config.rcc.hsi48 = Some(Hsi48Config {
-            sync_from_usb: true,
-        });
-        config.rcc.mux.clk48sel = mux::Clk48sel::Hsi48;
+        // FDCAN kernel clock: 24MHz HSE
+        config.rcc.mux.fdcansel = mux::Fdcansel::Hse;
     }
     embassy_stm32::init(config)
 }

@@ -1,60 +1,18 @@
-//! Delivery semantics — a typed ladder of delivery guarantees over ergot's
-//! at-most-once transport.
+//! Delivery semantics — a typed ladder of delivery guarantees.
 //!
-//! ergot delivers a request *now or never*: it arrives once or is dropped, with
-//! no built-in retry. Reliability is therefore the application's job, and the
-//! safe way to add it is to make the *kind* of guarantee a property of the
-//! command, checked by the compiler.
-//!
-//! # The ladder
-//!
-//! When the host retries (because it didn't get a response), the device may end
-//! up executing the command **0, 1, or 2+ times** — and the host cannot tell a
-//! lost *request* (executed 0×) from a lost *response* (executed 1×). So the one
-//! question that classifies every command is: *is executing it a second time
-//! harmful, and if so, can the device recognise and suppress the duplicate?*
-//!
-//! | Class            | Repeat is…           | Device memory | Client method        |
-//! |------------------|----------------------|---------------|----------------------|
-//! | [`Idempotent`]   | harmless by nature   | none          | `at_least_once`      |
-//! | [`Deduplicated`] | made harmless by id  | id → response  | `effectively_once`   |
-//! | [`AtMostOnce`]   | harmful, can't dedup | n/a           | `at_most_once`       |
-//!
-//! - **Idempotent** — reads and absolute setpoints (`set mode = X`). `f(f(x)) ==
-//!   f(x)`, so retrying blindly is safe; no device-side bookkeeping.
-//! - **Deduplicated** — a side-effecting action tagged with a stable
-//!   [`ReqId`]; the device caches `id → response` and returns the cache on a
-//!   repeat (see [`crate::delivery`] `Dedup`). Retry is safe because the *effect*
-//!   happens at most once even though delivery is at-least-once.
-//! - **AtMostOnce** — a harmful action that cannot be deduplicated (e.g. reboot:
-//!   the responder, and its dedup cache, are destroyed by the command). We do
-//!   **not** retry on timeout; the effect is confirmed by *observing state*, not
-//!   by the response.
-//!
-//! The class a command declares is the compiler-enforced ceiling on which client
-//! method may be used: you cannot `at_least_once` an [`AtMostOnce`] command. The
-//! marker is the author's promise that the command really has the stated effect
-//! semantics (like `Send`/`Sync` discipline) — the *ladder* is type-enforced, the
-//! idempotency itself is asserted.
+//! Retain the pure retry policy and delivery class markers without any ergot dependency.
 
-mod client;
 mod policy;
 
-pub use client::{Reliable, ReliableExt};
-pub use policy::{Decision, GiveUp, Outcome, RetryPolicy};
+pub use policy::{Decision, GiveUp, Outcome, RetryPolicy, decide};
 
 pub use crate::types::{Keyed, ReqId};
-
-use ergot::traits::Endpoint;
 
 mod sealed {
     pub trait Sealed {}
 }
 
 /// Where a command sits on the delivery-guarantee ladder.
-///
-/// Sealed: the set of classes is closed, so the client API can exhaustively
-/// gate its methods on them. The name is the *best achievable guarantee*.
 pub trait DeliveryClass: sealed::Sealed {}
 
 /// Read or absolute setpoint: `f(f(x)) == f(x)`. Safe to retry blindly.
@@ -71,21 +29,6 @@ impl sealed::Sealed for AtMostOnce {}
 impl DeliveryClass for Idempotent {}
 impl DeliveryClass for Deduplicated {}
 impl DeliveryClass for AtMostOnce {}
-
-/// Every command declares its delivery semantics. This is the single source of
-/// truth; the client API is generic over [`Command::Delivery`] so an unsafe
-/// retry does not compile.
-///
-/// Declare it next to the `endpoint!` definition, e.g.
-/// ```ignore
-/// impl Command for MotorEndpoint { type Delivery = Idempotent; }
-/// ```
-pub trait Command: Endpoint {
-    /// This command's place on the ladder.
-    type Delivery: DeliveryClass;
-    /// Tuned default retry budget for this command.
-    const POLICY: RetryPolicy = RetryPolicy::DEFAULT;
-}
 
 /// The outcome of a reliable send, told in terms of *what the caller may
 /// conclude about whether the effect happened* — this taxonomy is the guarantee.

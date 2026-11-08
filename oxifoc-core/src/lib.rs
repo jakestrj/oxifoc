@@ -153,11 +153,23 @@ macro_rules! clear_rc_w0 {
 /// - Device info and events
 pub mod types;
 
-/// Interface Control Document with ergot endpoints (requires `icd` feature)
-///
-/// Defines the communication protocol between host and device:
-/// - Endpoint definitions for ergot framework
-/// - Re-exports all types from the `types` module
+/// Generated femtopb protobuf definitions for wire messages.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::restriction,
+    missing_docs,
+    unused,
+    dead_code,
+    non_camel_case_types
+)]
+pub mod proto {
+    pub mod oxifoc {
+        include!("proto/oxifoc.rs");
+    }
+}
+
+/// Interface Control Document with streaming-protocol + NMEA definitions (requires `icd` feature)
 #[cfg(feature = "icd")]
 pub mod icd;
 

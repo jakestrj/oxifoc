@@ -79,38 +79,9 @@ pub const PWM_CONFIG: MotorPwmConfig = MotorPwmConfig::new();
 // ============================================================================
 
 // ============================================================================
-// Protocol Configuration
+// Protocol Configuration (CAN + NMEA + streaming-protocol)
 // ============================================================================
 
-/// Maximum size of a single packet
-pub const MAX_PACKET_SIZE: usize = 1024;
-
-// This value is also every interface's TX MTU: a full fast-telemetry batch
-// plus wire overhead must fit or full batches silently fail to broadcast.
-const _: () = assert!(
-    MAX_PACKET_SIZE
-        >= oxifoc_core::types::FAST_BATCH_BYTES + oxifoc_core::types::FAST_BATCH_WIRE_OVERHEAD
-);
-
-/// USB liveness timeout (ms): mark the USB interface Down if no frame arrives
-/// within this window. Shorter than the UART/ICD timeout for faster reaction.
-pub const USB_LIVENESS_TIMEOUT_MS: u64 = 3000;
-
-// ============================================================================
-// Transport Configuration
-// ============================================================================
-
-/// Size of outgoing packet queue for USB (framed)
-pub const USB_OUT_QUEUE_SIZE: usize = 2048;
-
-/// Size of outgoing packet queue for UART (COBS stream)
-pub const UART_OUT_QUEUE_SIZE: usize = 2048;
-
-/// Size of outgoing packet queue for the ergot-over-RTT interface (COBS stream).
-pub const RTT_OUT_QUEUE_SIZE: usize = 4096;
-
-/// LPUART1 baud rate (ST-LINK VCP)
-pub const UART_BAUD: u32 = 115_200;
-
-/// UART TX/RX buffer size
-pub const UART_BUF_LEN: usize = 1024;
+pub use oxifoc_core::icd::{
+    CAN_BITRATE, NMEA_INTER_FRAME_DELAY_MS, NMEA_RX_ARBITRATION_ID, NMEA_TX_ARBITRATION_ID,
+};

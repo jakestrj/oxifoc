@@ -1,0 +1,194 @@
+syntax = "proto3";
+
+package oxifoc;
+
+import "common/options.proto";
+
+// Operational state of the motor controller.
+enum MotorState {
+  MOTOR_STATE_STOPPED = 0;
+  MOTOR_STATE_RUNNING = 1;
+  MOTOR_STATE_ERROR = 2;
+}
+
+// Protocol-level fault categories.
+enum FaultCategory {
+  FAULT_CATEGORY_NONE = 0;
+  FAULT_CATEGORY_OVER_CURRENT = 1;
+  FAULT_CATEGORY_OVER_VOLTAGE = 2;
+  FAULT_CATEGORY_UNDER_VOLTAGE = 3;
+  FAULT_CATEGORY_OVER_TEMP = 4;
+  FAULT_CATEGORY_DRIVER_FAULT = 5;
+  FAULT_CATEGORY_HALL_ERROR = 6;
+  FAULT_CATEGORY_STALL = 7;
+  FAULT_CATEGORY_CALIBRATION_FAULT = 8;
+  FAULT_CATEGORY_COMM_TIMEOUT = 9;
+  FAULT_CATEGORY_DERATING = 10;
+}
+
+// Severity response class for a fault.
+enum FaultSeverity {
+  FAULT_SEVERITY_WARNING = 0;
+  FAULT_SEVERITY_GRACEFUL_STOP = 1;
+  FAULT_SEVERITY_KILL = 2;
+}
+
+// Electrical phase source selection.
+enum PhaseSourceKind {
+  PHASE_SOURCE_HALL = 0;
+  PHASE_SOURCE_ENCODER = 1;
+  PHASE_SOURCE_OBSERVER = 2;
+  PHASE_SOURCE_HFI = 3;
+  PHASE_SOURCE_HALL_TO_OBSERVER = 4;
+  PHASE_SOURCE_ENCODER_TO_OBSERVER = 5;
+  PHASE_SOURCE_HFI_TO_OBSERVER = 6;
+  PHASE_SOURCE_HFI_TO_HALL = 7;
+  PHASE_SOURCE_HFI_TO_ENCODER = 8;
+  PHASE_SOURCE_MANUAL = 9;
+  PHASE_SOURCE_OPEN_LOOP = 10;
+  PHASE_SOURCE_HFI_TO_OBSERVER_VOLTS = 11;
+}
+
+// Stopped mode (PWM disabled).
+message Stopped {}
+
+// Coast mode (all FETs high-Z).
+message Coast {}
+
+// Viscous brake mode (all low-side FETs on).
+message Brake {}
+
+// Current (torque) control mode.
+message CurrentControl {
+  float iq_target = 1;
+  float id_target = 2;
+}
+
+// Velocity control mode.
+message VelocityControl {
+  float target_vel = 1;
+}
+
+// Position control mode.
+message PositionControl {
+  float target_pos = 1;
+}
+
+// Open-loop control mode.
+message OpenLoopControl {
+  float angle_rad = 1;
+  float current = 2;
+  float velocity_rad_s = 3;
+  float kp = 4;
+  float ki = 5;
+  bool has_pi_gains = 6;
+}
+
+// Direct dq voltage mode.
+message DirectVoltageControl {
+  float vd = 1;
+  float vq = 2;
+  float angle_rad = 3;
+}
+
+// Motor control mode union.
+message ControlModeMessage {
+  oneof mode {
+    Stopped stopped = 1;
+    CurrentControl current_control = 2;
+    VelocityControl velocity_control = 3;
+    PositionControl position_control = 4;
+    OpenLoopControl open_loop = 5;
+    DirectVoltageControl direct_voltage = 6;
+    Coast coast = 7;
+    Brake brake = 8;
+  }
+}
+
+// Low-frequency system telemetry (device -> host).
+message SlowTelemetryMessage {
+  uint32 vbus_mv = 1;
+  int32 fet_temp_c_x10 = 2;
+  int32 motor_temp_c_x10 = 3;
+  int32 board_temp_c_x10 = 4;
+  MotorState motor_state = 5;
+  ControlModeMessage control_mode = 6;
+  uint32 fault_count = 7;
+  PhaseSourceKind phase_source = 8;
+  uint32 seq = 9;
+  uint32 derate_drive_pct = 10;
+  uint32 derate_brake_pct = 11;
+  uint32 fault_generation = 12;
+  uint32 derate_regen_pct = 13;
+}
+
+// High-frequency raw-ADC + FOC diagnostic telemetry (device -> host).
+message FastTelemetryMessage {
+  uint32 ia = 1;
+  uint32 ib = 2;
+  uint32 ic = 3;
+  uint32 vbus = 4;
+  uint32 angle = 5;
+  int32 vd = 6;
+  int32 vq = 7;
+  int32 rpm = 8;
+  uint32 seq = 9;
+}
+
+// Active fault registry snapshot (device -> host).
+message FaultStateMessage {
+  uint32 generation = 1;
+  uint32 active_categories_mask = 2;
+  uint32 total = 3;
+  FaultCategory primary_category = 4;
+  FaultSeverity max_severity = 5;
+}
+
+// Sequenced motor command request (host -> device).
+message MotorCommandRequest {
+  uint64 source_session = 1;
+  uint32 seq = 2;
+  bool emergency_stop = 3;
+  ControlModeMessage mode = 4;
+}
+
+// Fault clear request (host -> device).
+message FaultClearRequest {
+  uint32 expected_generation = 1;
+  bool clear_all = 2;
+  FaultCategory category = 3;
+}
+
+// Fast telemetry rate configuration request (host -> device).
+message TelemetryConfigRequest {
+  uint32 fast_hz = 1;
+}
+
+// Phase source switch request (host -> device).
+message PhaseSourceRequest {
+  PhaseSourceKind source = 1;
+  float blend_low = 2;
+  float blend_high = 3;
+  float min_vel = 4;
+  float min_confidence = 5;
+  float switch_vel = 6;
+  float toggle_v = 7;
+}
+
+// Top-level wire message encoded with streaming-protocol and fragmented via NMEA over CAN.
+message WireMessage {
+  option (common.msg_id) = 1;
+
+  oneof payload {
+    // Device -> Host telemetry
+    SlowTelemetryMessage slow_telemetry = 1;
+    FastTelemetryMessage fast_telemetry = 2;
+    FaultStateMessage fault_state = 3;
+
+    // Host -> Device commands
+    MotorCommandRequest motor_command = 10;
+    FaultClearRequest fault_clear = 11;
+    TelemetryConfigRequest telemetry_config = 12;
+    PhaseSourceRequest phase_source_request = 13;
+  }
+}
