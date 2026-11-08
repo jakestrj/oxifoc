@@ -4,6 +4,24 @@ package common;
 
 import "google/protobuf/descriptor.proto";
 
+message WireOptions {
+  string project = 1;
+}
+
+enum PayloadSource {
+  // HV BMS master
+  HV_BMS = 0;
+  ROTARY = 2;
+  OXIFOC = 3;
+  // PC Host.
+  HOST = 1;
+}
+
 extend google.protobuf.MessageOptions {
   optional uint32 msg_id = 50000;
+  WireOptions wire_options = 50002;
+}
+
+extend google.protobuf.FieldOptions {
+  PayloadSource payload_source = 50002;
 }

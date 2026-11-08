@@ -178,17 +178,18 @@ message PhaseSourceRequest {
 // Top-level wire message encoded with streaming-protocol and fragmented via NMEA over CAN.
 message WireMessage {
   option (common.msg_id) = 1;
+  option (common.wire_options).project = "oxifoc";
 
   oneof payload {
     // Device -> Host telemetry
-    SlowTelemetryMessage slow_telemetry = 1;
-    FastTelemetryMessage fast_telemetry = 2;
-    FaultStateMessage fault_state = 3;
+    SlowTelemetryMessage slow_telemetry = 1 [(common.payload_source) = OXIFOC];
+    FastTelemetryMessage fast_telemetry = 2 [(common.payload_source) = OXIFOC];
+    FaultStateMessage fault_state = 3 [(common.payload_source) = OXIFOC];
 
     // Host -> Device commands
-    MotorCommandRequest motor_command = 10;
-    FaultClearRequest fault_clear = 11;
-    TelemetryConfigRequest telemetry_config = 12;
-    PhaseSourceRequest phase_source_request = 13;
+    MotorCommandRequest motor_command = 10 [(common.payload_source) = HOST];
+    FaultClearRequest fault_clear = 11 [(common.payload_source) = HOST];
+    TelemetryConfigRequest telemetry_config = 12 [(common.payload_source) = HOST];
+    PhaseSourceRequest phase_source_request = 13 [(common.payload_source) = HOST];
   }
 }

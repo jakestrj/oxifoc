@@ -1,3 +1,4 @@
+mod can_server;
 mod sim;
 mod storage;
 mod tcp_server;
@@ -40,6 +41,8 @@ pub const VIRTUAL_CALIB: oxifoc_core::types::BoardCalib = oxifoc_core::types::Bo
 enum Transport {
     Tcp,
     Udp,
+    #[value(alias = "vcan", alias = "socketcan")]
+    Can,
 }
 
 #[derive(Parser)]
@@ -49,9 +52,15 @@ struct Args {
     /// Transport protocol
     #[arg(short, long, default_value = "tcp")]
     transport: Transport,
-    /// Listen port
+    /// Listen port (used for tcp/udp transports)
     #[arg(short, long, default_value_t = 2025)]
     port: u16,
+    /// SocketCAN interface name (used for can/vcan transport)
+    #[arg(short, long, default_value = "vcan0")]
+    can_interface: String,
+    /// Initial fast telemetry rate in Hz (0 = disabled until host requests)
+    #[arg(long, default_value_t = 0)]
+    fast_hz: u32,
     /// Simulated FOC frequency in Hz
     #[arg(short, long, default_value_t = 20_000)]
     foc_freq: u32,
@@ -96,11 +105,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.fast_hz > 0 {
+        let period = (args.foc_freq / args.fast_hz.max(1)).max(1);
+        oxifoc_core::runtime::streaming::FAST_TELEM_PERIOD
+            .store(period, core::sync::atomic::Ordering::Relaxed);
+    }
     tracing::info!(
-        "oxifoc-virtual: {:?} port={}, foc={}Hz, batch={}, vbus={}V, pp={}, max_i={}A",
+        "oxifoc-virtual: {:?} port={}, can={}, foc={}Hz, fast={}Hz, batch={}, vbus={}V, pp={}, max_i={}A",
         args.transport,
         args.port,
+        args.can_interface,
         args.foc_freq,
+        args.fast_hz,
         args.batch,
         args.vbus,
         args.pole_pairs,
@@ -149,6 +165,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Transport::Udp => {
             udp_server::run(args.port, args.foc_freq, &STATE, &FAULT_REGISTRY).await
+        }
+        Transport::Can => {
+            can_server::run(&args.can_interface, args.foc_freq, &STATE, &FAULT_REGISTRY).await
         }
     }
 }
