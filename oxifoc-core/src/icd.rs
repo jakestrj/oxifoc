@@ -34,6 +34,39 @@ pub const NMEA_INTER_FRAME_DELAY_MS: u64 = 2;
 /// Liveness timeout in milliseconds for communication link monitoring.
 pub const LIVENESS_TIMEOUT_MS: u64 = 3000;
 
+/// Size of a framed classic 8-byte CAN packet over TCP/UDP/Multicast:
+/// 2-byte little-endian 11-bit arbitration ID + 8-byte NMEA payload.
+pub const CAN_WIRE_FRAME_LEN: usize = 10;
+
+/// IPv4 Local Scope (RFC 2365) multicast group used for the cross-platform
+/// UDP Multicast Virtual CAN (`vcan`) bus (`239.255.79.88`).
+pub const VCAN_MULTICAST_IP: [u8; 4] = [239, 255, 79, 88];
+
+/// Base UDP port for `vcan0` / `can0` on the UDP Multicast Virtual CAN bus.
+pub const VCAN_MULTICAST_BASE_PORT: u16 = 29536;
+
+/// Deterministically map a CAN interface name (e.g. `"vcan0"`, `"can1"`, or a
+/// custom bus name) to a UDP port for the UDP Multicast Virtual CAN bus.
+#[must_use]
+pub fn vcan_multicast_port(can_interface: &str) -> u16 {
+    let name = can_interface.strip_prefix("mcast:").unwrap_or(can_interface);
+    if let Some(num_str) = name
+        .strip_prefix("vcan")
+        .or_else(|| name.strip_prefix("can"))
+        && let Ok(idx) = num_str.parse::<u16>()
+        && idx < 16
+    {
+        return VCAN_MULTICAST_BASE_PORT + idx;
+    }
+    // FNV-1a 32-bit hash mapped into [VCAN_MULTICAST_BASE_PORT + 16, VCAN_MULTICAST_BASE_PORT + 1000)
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in name.as_bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    VCAN_MULTICAST_BASE_PORT + 16 + (hash % 984) as u16
+}
+
 /// Compact, `Copy` snapshot of active fault state for `Watch`-based streaming.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -71,6 +104,34 @@ impl FaultStateSnapshot {
             total: snap.total,
             primary_category: primary,
             max_severity: max_sev,
+        }
+    }
+
+    /// Reconstruct a [`FaultSnapshot`] from the compact bitmask representation.
+    #[must_use]
+    pub fn to_fault_snapshot(self) -> FaultSnapshot {
+        const ALL_CATEGORIES: [(FaultCategory, &str); 10] = [
+            (FaultCategory::OverCurrent, "Over-current"),
+            (FaultCategory::OverVoltage, "Over-voltage"),
+            (FaultCategory::UnderVoltage, "Under-voltage"),
+            (FaultCategory::OverTemp, "Over-temperature"),
+            (FaultCategory::DriverFault, "Driver fault"),
+            (FaultCategory::HallError, "Hall sensor error"),
+            (FaultCategory::Stall, "Motor stall"),
+            (FaultCategory::CalibrationFault, "Calibration fault"),
+            (FaultCategory::CommTimeout, "Communication timeout"),
+            (FaultCategory::Derating, "Thermal/voltage derating"),
+        ];
+        let mut faults = heapless::Vec::new();
+        for (cat, desc) in ALL_CATEGORIES {
+            if (self.active_categories_mask & (1u32 << (cat as u32))) != 0 {
+                let _ = faults.push(FaultInfo::new(cat, desc));
+            }
+        }
+        FaultSnapshot {
+            generation: self.generation,
+            faults,
+            total: self.total,
         }
     }
 }

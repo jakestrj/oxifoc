@@ -4,35 +4,36 @@ pub mod discovery;
 pub mod ops;
 pub mod transport;
 
+use connection::CanFrameLink;
 #[cfg(test)]
 use connection::protocol_is_compatible;
-use connection::{run_cobs_stream_with_reconnect, run_framed_with_reconnect};
 
 use anyhow::{Context, Result, anyhow};
-use core::pin::pin;
 use crossbeam_channel::{Receiver, Sender};
 use defmt_decoder::{DecodeError, Table};
 use defmt_parser::Level as DefmtLevel;
-use ergot::Address;
-use ergot::interface_manager::{InterfaceState, LivenessConfig, Profile};
-use ergot::net_stack::NetStackHandle;
-use ergot::well_known::ErgotDefmtRxOwnedTopic;
-use oxifoc_core::delivery::{ReliableExt, RetryPolicy};
+use femtopb::{EnumValue, UnknownFields};
+use oxifoc_core::delivery::RetryPolicy;
 use oxifoc_core::foc::phase::PhaseSource;
 use oxifoc_core::icd::{
-    ConfigEndpoint, DetectEndpoint, FastTelemetryTopic, FaultTopic, MotorEndpoint,
-    SlowTelemetryEndpoint, TelemetryConfig, TelemetryConfigEndpoint,
+    FaultStateSnapshot, LIVENESS_TIMEOUT_MS, NMEA_TX_ARBITRATION_ID, TelemetryConfig,
 };
-use oxifoc_core::icd::{
-    FaultEndpoint, HardwareInfoEndpoint, LIVENESS_TIMEOUT_MS, PhaseSourceEndpoint,
+use oxifoc_core::proto::oxifoc::{
+    FaultCategory as ProtoFaultCategory, FaultClearRequest, TelemetryConfigRequest, WireMessage,
+    wire_message::Payload,
 };
-use oxifoc_core::timer::Timer;
+use oxifoc_core::runtime::servers::{CommsError, NmeaCanReceiver};
+use oxifoc_core::storage::{
+    CurrentLimitsConfig, DcOffsetsConfig, DeratingConfigStored, FailsafeConfigStored,
+    HallCalibrationConfig, HallTuningConfig, MotorParamsConfig, PiGainsConfig, PwmConfigStored,
+    RuntimeConfig, VelocityConfigStored, VoltageLimitsConfig,
+};
 use oxifoc_core::types::{
-    ConfigApply, ConfigGroupId, ConfigPersist, ConfigResponse, DetectRequest, DetectResponse,
-    FaultRequest, FaultSnapshot, HardwareInfo, MotorCommand, MotorRequest, MotorStatus,
-};
-use oxifoc_core::types::{
-    ControlMode, FastTelemetry, FaultResponse, Keyed, ReqId, SlowTelemetry, TelemetryConfigAck,
+    BoardCalib, ConfigApply, ConfigGroupId, ConfigPersist, ConfigResponse, ConfigSnapshot,
+    ConfigValue, ConfigWrite, ControlMode, DetectError, DetectRequest, DetectResponse,
+    FastTelemetry, FaultClearTarget, FaultRequest, FaultResponse, FaultSnapshot, HardwareInfo,
+    ICD_BOOTSTRAP_MAGIC, ICD_PROTO_VERSION, Keyed, MotorCommand, MotorCommandOutcome, MotorRequest,
+    MotorState, MotorStatus, SlowTelemetry, TelemetryConfigAck,
 };
 use std::{
     fs,
@@ -46,82 +47,60 @@ use std::{
 use tokio::io::AsyncRead;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub use config::{HostConfig, ReconnectPolicy};
 pub use discovery::{BleDeviceInfo, scan_ble_devices, scan_ble_devices_blocking};
 #[cfg(feature = "desktop")]
 pub use discovery::{ProbeInfo, SerialPortInfo, list_probes, list_serial_ports};
 pub use transport::{TransportConfig, TransportType};
-// The resolved-controller accessor returns an ergot address.
-pub use ergot::Address as DeviceAddress;
+
+/// Logical address of the resolved motor controller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeviceAddress {
+    pub network_id: u16,
+    pub node_id: u8,
+    pub port_id: u8,
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Link-local address of the directly connected peer (Router).
-///
-/// Uses net_id=0 ("link-local"): the router rewrites this to the real net_id.
-/// node_id=1 is CENTRAL_NODE_ID (the router side of the link). This is only
-/// the FALLBACK controller address: correct point-to-point, wrong through a
-/// bridge (there the link peer is the bridge, not the motor controller).
-/// Connect-time socket-query resolution in `connection.rs` replaces it with
-/// the address that actually serves `MotorEndpoint`.
-const LINK_LOCAL_PEER: Address = Address {
+const LINK_LOCAL_PEER: DeviceAddress = DeviceAddress {
     network_id: 0,
     node_id: 1,
     port_id: 0,
 };
-/// Per-attempt wait for the FIRST SocketQuery answer. The query is a single
-/// best-effort broadcast datagram — on a connectionless transport (UDP) the
-/// first attempt can race the peer binding its socket, so resolution retries
-/// like the handshake does.
-const RESOLVE_TIMEOUT: Duration = Duration::from_millis(400);
-/// Resolution attempts before falling back to the link-local peer.
-const RESOLVE_ATTEMPTS: u32 = 4;
-/// After the first answer, keep listening briefly so a SECOND controller on
-/// the network is detected as ambiguity instead of racing the winner.
-const RESOLVE_SETTLE: Duration = Duration::from_millis(150);
-const ERGOT_MTU: u16 = 4096;
-const ERGOT_QUEUE_SIZE: usize = 32768;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(800);
+
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-/// Retry budget for idempotent setpoints (motor / telemetry-config / config):
-/// a few attempts within a ~2 s total budget. Safe to retry on timeout because
-/// these are absolute setpoints / PUT-like config writes.
-const SETPOINT_POLICY: RetryPolicy = RetryPolicy {
-    deadline_ms: 2_000,
-    base_backoff_ms: 50,
-    max_backoff_ms: 400,
-    attempt_timeout_ms: 600,
+/// Cadence at which the active drive setpoint is re-affirmed to the device.
+const AFFIRM_INTERVAL: Duration = Duration::from_millis(50);
+/// Keepalive cadence when no drive setpoint is active, keeping the device's
+/// `LIVENESS_TIMEOUT_MS` (3000 ms) refreshed and ensuring UDP/Multicast peers
+/// stay registered.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Default board electrical constants used for telemetry enrichment on virtual
+/// or CAN devices that do not transmit a dedicated `HardwareInfo` frame.
+const DEFAULT_CAN_CALIB: BoardCalib = BoardCalib {
+    shunt_ohms: 0.003,
+    amp_gain: 64.0 / 7.0,
+    adc_vref_mv: 3300,
+    adc_max_counts: 4095,
+    invert_current_sign: true,
+    vbus_divider_ratio: 10.39,
 };
+
 /// Effectively-once budget for motor detection: one ~60 s attempt, plus room
 /// for a single retry whose (cached) response returns near-instantly.
-/// Public so front-ends derive their own wait deadlines from it instead of
-/// hardcoding a second number that can drift.
 pub const DETECT_POLICY: RetryPolicy = RetryPolicy {
     deadline_ms: 70_000,
     base_backoff_ms: 500,
     max_backoff_ms: 2_000,
     attempt_timeout_ms: 60_000,
 };
-/// Cadence at which the active drive setpoint is re-affirmed to the device.
-const AFFIRM_INTERVAL: Duration = Duration::from_millis(50);
-/// How long a detached motor-response observer waits before declaring the
-/// response lost (see [`send_motor_now`] — the SEND has already happened by
-/// then; this bounds only the reply bookkeeping).
-const MOTOR_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HandshakeOutcome {
-    Connected,
-    RetryableFailure,
-    FatalMismatch,
-}
 
 /// Record a failed connection generation and decide whether another one is
-/// permitted. `Limited(n)` preserves the existing meaning: at most `n`
-/// consecutive failed generations, including the one that just failed.
+/// permitted.
 fn may_retry(policy: ReconnectPolicy, failures: &mut u32) -> bool {
     *failures = failures.saturating_add(1);
     match policy {
@@ -129,35 +108,6 @@ fn may_retry(policy: ReconnectPolicy, failures: &mut u32) -> bool {
         ReconnectPolicy::Limited(max) => *failures < max,
         ReconnectPolicy::Infinite => true,
     }
-}
-
-/// Tokio-backed timer for the reliable-delivery client driver.
-struct TokioTimer;
-impl Timer for TokioTimer {
-    async fn after_millis(ms: u64) {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
-    async fn after_micros(us: u64) {
-        tokio::time::sleep(Duration::from_micros(us)).await;
-    }
-}
-
-/// Monotonic idempotency-key source for deduplicated requests (detection).
-///
-/// Seeded from wall-clock nanos: the device-side dedup cache outlives host
-/// processes and matches on `ReqId`, so two runs both starting at id 1 would
-/// make the device replay the previous run's cached response instead of
-/// executing the new (possibly different) request.
-fn next_detect_id() -> ReqId {
-    static CTR: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
-    let ctr = CTR.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        AtomicU64::new(nanos | 1)
-    });
-    ReqId(ctr.fetch_add(1, Ordering::Relaxed))
 }
 
 fn new_drive_session() -> u64 {
@@ -181,11 +131,6 @@ fn next_motor_request(session: u64, seq: &mut u32, command: MotorCommand) -> Mot
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Resolve the running firmware ELF path from `cfg.elf` (CLI `--elf`). Used both
-/// for defmt decoding and for pinning the RTT control block to the firmware's
-/// `_SEGGER_RTT` symbol. There is deliberately NO default: guessing the wrong
-/// board's ELF silently pins RTT to the wrong address (the link never routes)
-/// and decodes defmt against the wrong table, so a missing path is a hard error.
 fn resolve_elf_path(cfg: &HostConfig) -> Result<String> {
     cfg.elf.clone().ok_or_else(|| {
         anyhow!(
@@ -201,8 +146,6 @@ pub fn init_tracing() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        // CLI stdout is a stable data channel (`--json` emits exactly one
-        // document); diagnostics and connection logs belong on stderr.
         .with_writer(std::io::stderr)
         .with_target(true)
         .with_level(true)
@@ -229,8 +172,7 @@ pub fn detect_channel() -> (DetectResponseSender, DetectResponseReceiver) {
 }
 
 /// Acknowledged motor-command channel: carries the device's MotorStatus
-/// (or the delivery error) back to the caller — for CLI-style users that
-/// must exit nonzero when the command did not reach the device.
+/// (or the delivery error) back to the caller.
 pub type MotorResponseSender = tokio::sync::oneshot::Sender<Result<MotorStatus>>;
 pub type MotorResponseReceiver = tokio::sync::oneshot::Receiver<Result<MotorStatus>>;
 
@@ -248,10 +190,7 @@ pub fn fault_channel() -> (FaultResponseSender, FaultResponseReceiver) {
     tokio::sync::oneshot::channel()
 }
 
-/// Telemetry-config ack channel: carries the device's ack (or the delivery
-/// error) back to the caller, correlated with exactly this request — the
-/// `HostRuntime::fast_hz` flag alone cannot distinguish a fresh ack from a
-/// rate that was already active before the request.
+/// Telemetry-config ack channel.
 pub type TelemetryAckSender = tokio::sync::oneshot::Sender<Result<TelemetryConfigAck>>;
 pub type TelemetryAckReceiver = tokio::sync::oneshot::Receiver<Result<TelemetryConfigAck>>;
 
@@ -265,13 +204,10 @@ pub enum HostCommand {
     /// Like [`Motor`](Self::Motor) but replies with the device's status
     /// (or the delivery error).
     MotorAck(ControlMode, MotorResponseSender),
-    /// Immediate high-Z stop through the existing motor endpoint. The device
-    /// latches re-arm until a later safe mode command.
+    /// Immediate high-Z stop through the motor endpoint.
     EmergencyStop(MotorResponseSender),
     SetPhaseSource(PhaseSource),
-    /// Change the fast-telemetry rate. The optional ack channel receives the
-    /// device's response for THIS request; the requested rate also becomes
-    /// the rate re-applied after a reconnect.
+    /// Change the fast-telemetry rate.
     SetTelemetryConfig(TelemetryConfig, Option<TelemetryAckSender>),
     ConfigRead(ConfigGroupId, ConfigResponseSender),
     ConfigApply(Keyed<ConfigApply>, ConfigResponseSender),
@@ -279,21 +215,16 @@ pub enum HostCommand {
     /// Erase every stored config group (factory reset).
     ConfigResetAll(ConfigResponseSender),
     Detect(DetectRequest, DetectResponseSender),
-    /// Query or clear device faults (`FaultEndpoint`).
+    /// Query or clear device faults.
     Fault(FaultRequest, FaultResponseSender),
 }
 
-/// Sender half of the host→backend command channel. The `ops` helpers take
-/// this rather than the whole [`HostRuntime`] so they can run from any thread
-/// with a cheap clone — in particular off the GUI's runtime mutex, so a long
-/// detection sequence never blocks the UI's Stop/Coast handlers.
+/// Sender half of the host→backend command channel.
 pub type CommandSender = tokio::sync::mpsc::UnboundedSender<HostCommand>;
 
 pub struct HostRuntime {
     pub fast_rx: Receiver<FastTelemetry>,
     pub slow_rx: Receiver<SlowTelemetry>,
-    /// Full fault snapshots from FaultTopic plus generation-based query
-    /// reconciliation when a topic or host handoff was lost.
     pub fault_rx: Receiver<FaultSnapshot>,
     pub device_info_rx: Receiver<HardwareInfo>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<HostCommand>,
@@ -301,18 +232,11 @@ pub struct HostRuntime {
     pub fast_hz: Arc<AtomicU16>,
     device_addr: Arc<AtomicU32>,
     cancel_token: CancellationToken,
-    /// Backend thread handle — joined (bounded) on shutdown so the process
-    /// never exits while the RTT I/O thread is mid-USB-transaction (which
-    /// wedges the ST-Link for the next open). Mutex<Option<..>> so both
-    /// `shutdown(&self)` and `Drop` can take it exactly once.
     backend_thread: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl HostRuntime {
-    /// The controller address the backend currently targets: the SocketQuery
-    /// resolution result for this connection generation, or the link-local
-    /// peer when nothing answered (plain point-to-point).
-    pub fn device_address(&self) -> Address {
+    pub fn device_address(&self) -> DeviceAddress {
         unpack_addr(self.device_addr.load(Ordering::Relaxed))
     }
 
@@ -336,10 +260,6 @@ impl HostRuntime {
         self.join_backend(Duration::from_secs(3));
     }
 
-    /// Wait (bounded) for the backend thread to finish its shutdown path —
-    /// in particular the RTT I/O thread join that closes the probe-rs
-    /// session cleanly. Skipping this and exiting the process kills that
-    /// thread mid-USB-transaction and wedges the ST-Link for the next open.
     fn join_backend(&self, timeout: Duration) {
         let handle = self
             .backend_thread
@@ -359,24 +279,12 @@ impl HostRuntime {
     }
 }
 
-/// Build the raw→engineering enrichment context from the device: `BoardCalib`
-/// (from the handshake `HardwareInfo`) + `dc_offsets` and `pole_pairs` (config
-/// reads on `cmd`). Offsets fall back to mid-scale and `pole_pairs` to 0 when the
-/// device stores neither (uncalibrated / virtual). A free function over the
-/// command sender (not `&HostRuntime`) so the GUI can clone `cmd_tx` out of its
-/// runtime mutex first — never holding the lock across the blocking config
-/// reads. Shared by the CLI (record/watch) and the GUI so both enrich through the
-/// identical core path.
 pub fn build_enrich_ctx(
     cmd: &CommandSender,
     hw: Option<&HardwareInfo>,
 ) -> Option<oxifoc_core::foc::telemetry::EnrichCtx> {
     use oxifoc_core::types::{ConfigGroupId, ConfigValue};
     let calib = hw?.calib;
-    // Fallbacks below are LOUD: a transient config-read failure (busy link,
-    // reconnect window) silently degrading to mid-scale offsets skews every
-    // reconstructed phase current — measured ~15 A/phase on the g431 — while
-    // the columns still look plausible. The warn is the only trace.
     let offsets = ops::config::read_group(cmd, ConfigGroupId::DcOffsets)
         .ok()
         .and_then(|snapshot| match snapshot.value {
@@ -407,11 +315,6 @@ pub fn build_enrich_ctx(
 }
 
 impl Drop for HostRuntime {
-    /// Cancel the backend on drop: replacing the runtime slot on a GUI
-    /// reconnect must not leak the old tokio runtime + thread (which would
-    /// keep holding the serial port / probe). Idempotent with `shutdown()`.
-    /// Also joins the backend (bounded) so a plain drop-without-shutdown
-    /// still closes the probe session cleanly before the process moves on.
     fn drop(&mut self) {
         self.cancel_token.cancel();
         self.join_backend(Duration::from_secs(3));
@@ -420,7 +323,6 @@ impl Drop for HostRuntime {
 
 // ── Backend context ──────────────────────────────────────────────────────────
 
-/// Shared state passed through the backend instead of many individual arguments.
 struct BackendCtx {
     fast_tx: Sender<FastTelemetry>,
     slow_tx: Sender<SlowTelemetry>,
@@ -429,20 +331,11 @@ struct BackendCtx {
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HostCommand>,
     connected: Arc<AtomicBool>,
     fast_hz: Arc<AtomicU16>,
-    /// The last fast rate the application asked for (config default until a
-    /// SetTelemetryConfig arrives) — what a reconnect re-applies.
     requested_fast_hz: Arc<AtomicU16>,
-    /// Packed [`Address`] of the resolved motor controller (see
-    /// [`pack_addr`]). Starts as the link-local peer; each connection
-    /// generation overwrites it with the SocketQuery resolution result
-    /// before `connected` is published.
     device_addr: Arc<AtomicU32>,
     cancel: CancellationToken,
 }
 
-/// Ordered, loss-aware handoff from protocol tasks to synchronous consumers.
-/// Topic delivery and SlowTelemetry reconciliation can race; the mutex makes
-/// it impossible for an older snapshot to overwrite a newer one.
 #[derive(Clone)]
 struct FaultSnapshotSink {
     tx: Sender<FaultSnapshot>,
@@ -467,6 +360,7 @@ impl FaultSnapshotSink {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn needs(&self, generation: u32) -> bool {
         self.delivered_generation
             .lock()
@@ -533,7 +427,199 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
 
 // ── Backend dispatch ─────────────────────────────────────────────────────────
 
-async fn backend_main(cfg: HostConfig, ctx: BackendCtx) -> Result<()> {
+async fn open_can_link(transport_config: &TransportConfig, cfg: &HostConfig) -> Result<CanFrameLink> {
+    match transport_config {
+        TransportConfig::Can { interface } => {
+            let ep = transport::can::connect(interface)?;
+            Ok(CanFrameLink::Can(ep))
+        }
+        TransportConfig::Tcp { host, port } => {
+            let stream = transport::tcp::connect(host, *port).await?;
+            Ok(CanFrameLink::Stream(stream))
+        }
+        TransportConfig::Udp { host, port } => {
+            let socket = transport::udp::connect(host, *port).await?;
+            Ok(CanFrameLink::Udp(socket))
+        }
+        #[cfg(feature = "desktop")]
+        TransportConfig::Serial { path, baud } => {
+            let stream = transport::serial::connect(path, *baud)?;
+            Ok(CanFrameLink::Stream(stream))
+        }
+        #[cfg(feature = "desktop")]
+        TransportConfig::Rtt { probe, chip } => {
+            let elf = resolve_elf_path(cfg)?;
+            let stream = transport::rtt::connect(probe.as_deref(), chip, Some(&elf))?;
+            Ok(CanFrameLink::Stream(stream))
+        }
+        TransportConfig::Usb => {
+            transport::usb::connect().await?;
+            unreachable!()
+        }
+        TransportConfig::Ble { .. } => {
+            anyhow::bail!("BLE transport is not supported in CAN streaming-protocol mode")
+        }
+    }
+}
+
+fn default_can_hardware_info() -> HardwareInfo {
+    let mut hw = heapless::String::new();
+    let _ = hw.push_str("oxifoc-can");
+    let mut sw = heapless::String::new();
+    let _ = sw.push_str(env!("CARGO_PKG_VERSION"));
+    let mut mcu = heapless::String::new();
+    let _ = mcu.push_str("CAN/NMEA");
+    let mut uuid = heapless::String::new();
+    let _ = uuid.push_str("0x7E5-0x7ED");
+    HardwareInfo {
+        bootstrap_magic: ICD_BOOTSTRAP_MAGIC,
+        proto_version: ICD_PROTO_VERSION,
+        capabilities: 0,
+        reserved: [0; 8],
+        hw,
+        sw,
+        mcu,
+        uuid,
+        foc_freq_hz: 20_000,
+        max_current_a: 40.0,
+        calib: DEFAULT_CAN_CALIB,
+    }
+}
+
+struct LocalConfigStore {
+    runtime: RuntimeConfig,
+    revisions: [u32; ConfigGroupId::COUNT],
+}
+
+impl Default for LocalConfigStore {
+    fn default() -> Self {
+        Self {
+            runtime: RuntimeConfig {
+                motor_params: Some(MotorParamsConfig {
+                    resistance_ohm: 0.5,
+                    inductance_d_h: 5e-4,
+                    inductance_q_h: 5e-4,
+                    flux_linkage_wb: 0.01,
+                    pole_pairs: 7,
+                    max_current_a: 40.0,
+                    max_power_loss_w: 0.0,
+                    ..Default::default()
+                }),
+                dc_offsets: Some(DcOffsetsConfig {
+                    phase_a: 2047.5,
+                    phase_b: 2047.5,
+                    phase_c: 2047.5,
+                }),
+                current_limits: Some(CurrentLimitsConfig::default()),
+                voltage_limits: Some(VoltageLimitsConfig::default()),
+                pwm_config: Some(PwmConfigStored::default()),
+                pi_gains: Some(PiGainsConfig::default()),
+                hall_tuning: Some(HallTuningConfig::default()),
+                hall_calibration: Some(HallCalibrationConfig::default()),
+                failsafe: Some(FailsafeConfigStored::default()),
+                velocity: Some(VelocityConfigStored::default()),
+                derating: Some(DeratingConfigStored::default()),
+            },
+            revisions: [1; ConfigGroupId::COUNT],
+        }
+    }
+}
+
+impl LocalConfigStore {
+    fn group_index(group: ConfigGroupId) -> usize {
+        ConfigGroupId::ALL
+            .iter()
+            .position(|&g| g == group)
+            .unwrap_or(0)
+    }
+
+    fn snapshot(&self, group: ConfigGroupId) -> ConfigSnapshot {
+        let idx = Self::group_index(group);
+        let value = match group {
+            ConfigGroupId::MotorParams => {
+                self.runtime.motor_params.clone().map(ConfigValue::MotorParams)
+            }
+            ConfigGroupId::HallCalibration => self
+                .runtime
+                .hall_calibration
+                .clone()
+                .map(ConfigValue::HallCalibration),
+            ConfigGroupId::DcOffsets => self.runtime.dc_offsets.clone().map(ConfigValue::DcOffsets),
+            ConfigGroupId::CurrentLimits => self
+                .runtime
+                .current_limits
+                .clone()
+                .map(ConfigValue::CurrentLimits),
+            ConfigGroupId::VoltageLimits => self
+                .runtime
+                .voltage_limits
+                .clone()
+                .map(ConfigValue::VoltageLimits),
+            ConfigGroupId::PwmConfig => self.runtime.pwm_config.clone().map(ConfigValue::PwmConfig),
+            ConfigGroupId::PiGains => self.runtime.pi_gains.clone().map(ConfigValue::PiGains),
+            ConfigGroupId::HallTuning => {
+                self.runtime.hall_tuning.clone().map(ConfigValue::HallTuning)
+            }
+            ConfigGroupId::Failsafe => self.runtime.failsafe.clone().map(ConfigValue::Failsafe),
+            ConfigGroupId::Velocity => self.runtime.velocity.clone().map(ConfigValue::Velocity),
+            ConfigGroupId::Derating => self.runtime.derating.clone().map(ConfigValue::Derating),
+        };
+        ConfigSnapshot {
+            group,
+            revision: self.revisions[idx],
+            persisted: value.is_some(),
+            value,
+        }
+    }
+
+    fn apply(&mut self, req: Keyed<ConfigApply>) -> ConfigResponse {
+        let group = req.inner.write.group();
+        let idx = Self::group_index(group);
+        if req.inner.expected_revision != self.revisions[idx] {
+            return ConfigResponse::Conflict {
+                current_revision: self.revisions[idx],
+            };
+        }
+        match req.inner.write {
+            ConfigWrite::MotorParams(v) => self.runtime.motor_params = Some(v),
+            ConfigWrite::HallCalibration(v) => self.runtime.hall_calibration = Some(v),
+            ConfigWrite::DcOffsets(v) => self.runtime.dc_offsets = Some(v),
+            ConfigWrite::CurrentLimits(v) => self.runtime.current_limits = Some(v),
+            ConfigWrite::VoltageLimits(v) => self.runtime.voltage_limits = Some(v),
+            ConfigWrite::PwmConfig(v) => self.runtime.pwm_config = Some(v),
+            ConfigWrite::PiGains(v) => self.runtime.pi_gains = Some(v),
+            ConfigWrite::HallTuning(v) => self.runtime.hall_tuning = Some(v),
+            ConfigWrite::Failsafe(v) => self.runtime.failsafe = Some(v),
+            ConfigWrite::Velocity(v) => self.runtime.velocity = Some(v),
+            ConfigWrite::Derating(v) => self.runtime.derating = Some(v),
+        }
+        self.revisions[idx] = self.revisions[idx].wrapping_add(1);
+        ConfigResponse::Applied {
+            req_id: req.id,
+            revision: self.revisions[idx],
+        }
+    }
+
+    fn persist(&self, req: Keyed<ConfigPersist>) -> ConfigResponse {
+        let idx = Self::group_index(req.inner.group);
+        if req.inner.expected_revision != self.revisions[idx] {
+            return ConfigResponse::Conflict {
+                current_revision: self.revisions[idx],
+            };
+        }
+        ConfigResponse::Persisted {
+            req_id: req.id,
+            revision: self.revisions[idx],
+        }
+    }
+
+    fn reset_all(&mut self) -> ConfigResponse {
+        *self = Self::default();
+        ConfigResponse::Reset
+    }
+}
+
+async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
     let transport_type = cfg.transport_type();
     info!("Oxifoc Host backend - transport: {:?}", transport_type);
 
@@ -543,374 +629,415 @@ async fn backend_main(cfg: HostConfig, ctx: BackendCtx) -> Result<()> {
     }
 
     let transport_config = cfg.transport_config()?;
+    let policy = cfg.reconnect_policy();
+    let mut connect_attempts: u32 = 0;
+    let mut defmt_started = false;
+    let mut config_store = LocalConfigStore::default();
+    let drive_session = new_drive_session();
+    let mut motor_seq = 1u32;
 
-    match transport_config {
-        TransportConfig::Tcp { host, port } => {
-            run_cobs_stream_with_reconnect(
-                move || {
-                    let host = host.clone();
-                    async move { transport::tcp::connect(&host, port).await }
-                },
-                &cfg,
-                ctx,
-            )
-            .await
-        }
-        #[cfg(feature = "desktop")]
-        TransportConfig::Serial { path, baud } => {
-            run_cobs_stream_with_reconnect(
-                move || {
-                    let path = path.clone();
-                    async move { transport::serial::connect(&path, baud) }
-                },
-                &cfg,
-                ctx,
-            )
-            .await
-        }
-        #[cfg(feature = "desktop")]
-        TransportConfig::Rtt { probe, chip } => {
-            let elf = resolve_elf_path(&cfg)?;
-            run_cobs_stream_with_reconnect(
-                move || {
-                    let probe = probe.clone();
-                    let chip = chip.clone();
-                    let elf = elf.clone();
-                    async move { transport::rtt::connect(probe.as_deref(), &chip, Some(&elf)) }
-                },
-                &cfg,
-                ctx,
-            )
-            .await
-        }
-        TransportConfig::Udp { host, port } => {
-            let state_notify = Arc::new(ergot::toolkits::tokio_stream::WaitQueue::new());
-            let (stack, queue) = transport::udp::new_stack(ERGOT_QUEUE_SIZE, ERGOT_MTU);
-            let register_fn = {
-                let stack = stack.clone();
-                let notify = state_notify.clone();
-                async move || {
-                    transport::udp::register(&stack, &queue, &host, port, Some(notify.clone()))
-                        .await
+    loop {
+        let link_res = tokio::select! {
+            r = open_can_link(&transport_config, &cfg) => r,
+            _ = ctx.cancel.cancelled() => break,
+        };
+
+        let mut link = match link_res {
+            Ok(l) => l,
+            Err(e) => {
+                ctx.connected.store(false, Ordering::Relaxed);
+                let retry = may_retry(policy, &mut connect_attempts);
+                warn!(
+                    "Transport open failed (attempt {}): {:?}",
+                    connect_attempts, e
+                );
+                if !retry {
+                    info!("Reconnect policy exhausted — giving up");
+                    break;
                 }
-            };
-            run_framed_with_reconnect(stack, register_fn, state_notify, &cfg, ctx).await
-        }
-        TransportConfig::Usb => {
-            let state_notify = Arc::new(ergot::toolkits::tokio_stream::WaitQueue::new());
-            let (stack, queue) = transport::usb::new_stack();
-            let register_fn = {
-                let stack = stack.clone();
-                let notify = state_notify.clone();
-                let mut selected_identity = None;
-                async move || {
-                    transport::usb::register(
-                        &stack,
-                        &queue,
-                        Some(notify.clone()),
-                        &mut selected_identity,
-                    )
-                    .await
+                tokio::select! {
+                    _ = tokio::time::sleep(RECONNECT_DELAY) => continue,
+                    _ = ctx.cancel.cancelled() => break,
                 }
-            };
-            run_framed_with_reconnect(stack, register_fn, state_notify, &cfg, ctx).await
+            }
+        };
+
+        if let Some(defmt_reader) = link.take_defmt_reader()
+            && should_start_defmt(cfg.stream_defmt(), defmt_started, true)
+        {
+            match start_rtt_defmt_decoder(&cfg, defmt_reader) {
+                Ok(()) => defmt_started = true,
+                Err(e) => warn!("defmt decoder unavailable, continuing without it: {e:#}"),
+            }
         }
-        TransportConfig::Ble { device } => {
-            let state_notify = Arc::new(ergot::toolkits::tokio_stream::WaitQueue::new());
-            let (stack, queue) = transport::ble::new_stack();
-            let register_fn = {
-                let stack = stack.clone();
-                let notify = state_notify.clone();
-                let mut workers = Vec::new();
-                async move || {
-                    transport::ble::register(
-                        &stack,
-                        &queue,
-                        &device,
-                        Some(notify.clone()),
-                        &mut workers,
-                    )
-                    .await
+
+        // Send initial TelemetryConfigRequest on 0x7E5 to wake the link and
+        // register our peer address on connectionless transports (UDP/Multicast).
+        let initial_fast_hz = ctx.requested_fast_hz.load(Ordering::Relaxed);
+        let init_msg = WireMessage {
+            payload: Some(Payload::TelemetryConfig(TelemetryConfigRequest {
+                fast_hz: u32::from(initial_fast_hz),
+                unknown_fields: UnknownFields::empty(),
+            })),
+            unknown_fields: UnknownFields::empty(),
+        };
+        if let Err(e) = link.send_wire_message(&init_msg).await {
+            warn!("Initial telemetry config send failed: {e:#}");
+        } else {
+            ctx.fast_hz.store(initial_fast_hz, Ordering::Relaxed);
+        }
+
+        let mut nmea_rx = NmeaCanReceiver::new();
+        let mut active_setpoint: Option<ControlMode> = None;
+        let mut last_slow: Option<SlowTelemetry> = None;
+        let mut latest_fault_snap = FaultSnapshot::default();
+        let mut last_rx_at = Instant::now();
+        let mut affirm_ticker = tokio::time::interval(AFFIRM_INTERVAL);
+        affirm_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut keepalive_ticker = tokio::time::interval(KEEPALIVE_INTERVAL);
+        keepalive_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let session_lost = loop {
+            tokio::select! {
+                _ = ctx.cancel.cancelled() => break false,
+
+                frame_res = link.recv_frame() => {
+                    match frame_res {
+                        Ok((arb_id, data)) => {
+                            if arb_id != NMEA_TX_ARBITRATION_ID {
+                                continue;
+                            }
+                            last_rx_at = Instant::now();
+                            if !ctx.connected.load(Ordering::Relaxed) {
+                                ctx.connected.store(true, Ordering::Relaxed);
+                                ctx.device_addr
+                                    .store(u32::from(NMEA_TX_ARBITRATION_ID), Ordering::Relaxed);
+                                ctx.fault_sink.reset_generation();
+                                connect_attempts = 0;
+                                let _ = ctx.info_tx.try_send(default_can_hardware_info());
+                                info!("CAN device link active (RX=0x7ED, TX=0x7E5)");
+                            }
+                            let decoded = nmea_rx.push_frame_with(&data, |proto| {
+                                match proto.payload.as_ref() {
+                                    Some(Payload::SlowTelemetry(s)) => {
+                                        Ok(DecodedCanMessage::Slow(SlowTelemetry::from(s)))
+                                    }
+                                    Some(Payload::FastTelemetry(f)) => {
+                                        Ok(DecodedCanMessage::Fast(FastTelemetry::from(f)))
+                                    }
+                                    Some(Payload::FaultState(flt)) => {
+                                        Ok(DecodedCanMessage::Fault(FaultStateSnapshot::from(flt)))
+                                    }
+                                    _ => Err(CommsError::InvalidRequest),
+                                }
+                            });
+                            match decoded {
+                                Ok(Some(DecodedCanMessage::Slow(slow))) => {
+                                    last_slow = Some(slow);
+                                    let _ = ctx.slow_tx.try_send(slow);
+                                }
+                                Ok(Some(DecodedCanMessage::Fast(fast))) => {
+                                    let _ = ctx.fast_tx.try_send(fast);
+                                }
+                                Ok(Some(DecodedCanMessage::Fault(fault_state))) => {
+                                    let snap = fault_state.to_fault_snapshot();
+                                    latest_fault_snap = snap.clone();
+                                    ctx.fault_sink.offer(snap);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    debug!("CAN NMEA decode error: {e:?}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("CAN link read error: {e:#}");
+                            break true;
+                        }
+                    }
                 }
+
+                cmd = ctx.cmd_rx.recv() => {
+                    let Some(cmd) = cmd else { break false };
+                    if !ctx.connected.load(Ordering::Relaxed) {
+                        active_setpoint = None;
+                        reject_unverified_command(cmd);
+                        continue;
+                    }
+                    handle_can_command(
+                        &mut link,
+                        cmd,
+                        &ctx.fast_hz,
+                        &ctx.requested_fast_hz,
+                        &mut active_setpoint,
+                        drive_session,
+                        &mut motor_seq,
+                        last_slow.as_ref(),
+                        &mut latest_fault_snap,
+                        &mut config_store,
+                    ).await;
+                }
+
+                _ = affirm_ticker.tick() => {
+                    if ctx.connected.load(Ordering::Relaxed)
+                        && last_rx_at.elapsed() > Duration::from_millis(LIVENESS_TIMEOUT_MS)
+                    {
+                        warn!("No CAN frames received within {LIVENESS_TIMEOUT_MS}ms; marking link inactive");
+                        ctx.connected.store(false, Ordering::Relaxed);
+                        active_setpoint = None;
+                    }
+                    if let Some(mode) = active_setpoint {
+                        let req = next_motor_request(
+                            drive_session,
+                            &mut motor_seq,
+                            MotorCommand::SetMode(mode),
+                        );
+                        let msg = WireMessage {
+                            payload: Some(Payload::MotorCommand(req.into())),
+                            unknown_fields: UnknownFields::empty(),
+                        };
+                        if let Err(e) = link.send_wire_message(&msg).await {
+                            warn!("Setpoint affirm send failed: {e:#}");
+                        }
+                    }
+                }
+
+                _ = keepalive_ticker.tick() => {
+                    if active_setpoint.is_none() {
+                        let hz = ctx.requested_fast_hz.load(Ordering::Relaxed);
+                        let msg = WireMessage {
+                            payload: Some(Payload::TelemetryConfig(TelemetryConfigRequest {
+                                fast_hz: u32::from(hz),
+                                unknown_fields: UnknownFields::empty(),
+                            })),
+                            unknown_fields: UnknownFields::empty(),
+                        };
+                        let _ = link.send_wire_message(&msg).await;
+                    }
+                }
+            }
+        };
+
+        ctx.connected.store(false, Ordering::Relaxed);
+        if !session_lost {
+            break;
+        }
+        if !may_retry(policy, &mut connect_attempts) {
+            info!("Reconnect policy exhausted after connection loss");
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+            _ = ctx.cancel.cancelled() => break,
+        }
+        info!("Attempting reconnection...");
+    }
+
+    ctx.connected.store(false, Ordering::Relaxed);
+    #[cfg(feature = "desktop")]
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        transport::rtt::join_rtt_io_thread(Duration::from_secs(2));
+    }
+
+    info!("Host backend shutdown complete");
+    Ok(())
+}
+
+enum DecodedCanMessage {
+    Slow(SlowTelemetry),
+    Fast(FastTelemetry),
+    Fault(FaultStateSnapshot),
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flat backend dispatch; a struct would just move the names"
+)]
+async fn handle_can_command(
+    link: &mut CanFrameLink,
+    cmd: HostCommand,
+    fast_hz_flag: &Arc<AtomicU16>,
+    requested_fast_hz: &Arc<AtomicU16>,
+    active_setpoint: &mut Option<ControlMode>,
+    drive_session: u64,
+    motor_seq: &mut u32,
+    last_slow: Option<&SlowTelemetry>,
+    latest_fault_snap: &mut FaultSnapshot,
+    config_store: &mut LocalConfigStore,
+) {
+    let current_status = |mode_override: Option<ControlMode>| -> MotorStatus {
+        let state = match mode_override.or_else(|| last_slow.map(|s| s.control_mode)) {
+            Some(ControlMode::Stopped | ControlMode::Coast | ControlMode::Brake) | None => {
+                last_slow.map_or(MotorState::Stopped, |s| s.motor_state)
+            }
+            Some(_) => MotorState::Running,
+        };
+        MotorStatus {
+            state,
+            mode: mode_override.unwrap_or_else(|| {
+                last_slow.map_or(ControlMode::Stopped, |s| s.control_mode)
+            }),
+            fault_count: last_slow.map_or(latest_fault_snap.total, |s| s.fault_count),
+            outcome: MotorCommandOutcome::Applied,
+        }
+    };
+
+    match cmd {
+        HostCommand::Motor(mc) => {
+            *active_setpoint = if matches!(
+                mc,
+                ControlMode::Stopped | ControlMode::Coast | ControlMode::Brake
+            ) {
+                None
+            } else {
+                Some(mc)
             };
-            run_framed_with_reconnect(stack, register_fn, state_notify, &cfg, ctx).await
+            let request = next_motor_request(drive_session, motor_seq, MotorCommand::SetMode(mc));
+            let msg = WireMessage {
+                payload: Some(Payload::MotorCommand(request.into())),
+                unknown_fields: UnknownFields::empty(),
+            };
+            if let Err(e) = link.send_wire_message(&msg).await {
+                warn!("Motor command send failed: {e:#}");
+            }
+        }
+        HostCommand::MotorAck(mc, reply_tx) => {
+            *active_setpoint = if matches!(
+                mc,
+                ControlMode::Stopped | ControlMode::Coast | ControlMode::Brake
+            ) {
+                None
+            } else {
+                Some(mc)
+            };
+            let request = next_motor_request(drive_session, motor_seq, MotorCommand::SetMode(mc));
+            let msg = WireMessage {
+                payload: Some(Payload::MotorCommand(request.into())),
+                unknown_fields: UnknownFields::empty(),
+            };
+            let res = link
+                .send_wire_message(&msg)
+                .await
+                .map(|()| current_status(Some(mc)));
+            let _ = reply_tx.send(res);
+        }
+        HostCommand::EmergencyStop(reply_tx) => {
+            *active_setpoint = None;
+            let request = next_motor_request(drive_session, motor_seq, MotorCommand::EmergencyStop);
+            let msg = WireMessage {
+                payload: Some(Payload::MotorCommand(request.into())),
+                unknown_fields: UnknownFields::empty(),
+            };
+            let res = link
+                .send_wire_message(&msg)
+                .await
+                .map(|()| current_status(Some(ControlMode::Stopped)));
+            let _ = reply_tx.send(res);
+        }
+        HostCommand::SetPhaseSource(source) => {
+            let msg = WireMessage {
+                payload: Some(Payload::PhaseSourceRequest(source.to_proto_request())),
+                unknown_fields: UnknownFields::empty(),
+            };
+            if let Err(e) = link.send_wire_message(&msg).await {
+                warn!("Phase source command failed: {e:#}");
+            }
+        }
+        HostCommand::SetTelemetryConfig(cfg, reply) => {
+            requested_fast_hz.store(cfg.fast_hz, Ordering::Relaxed);
+            let msg = WireMessage {
+                payload: Some(Payload::TelemetryConfig(TelemetryConfigRequest {
+                    fast_hz: u32::from(cfg.fast_hz),
+                    unknown_fields: UnknownFields::empty(),
+                })),
+                unknown_fields: UnknownFields::empty(),
+            };
+            match link.send_wire_message(&msg).await {
+                Ok(()) => {
+                    fast_hz_flag.store(cfg.fast_hz, Ordering::Relaxed);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(TelemetryConfigAck {
+                            actual_fast_hz: cfg.fast_hz,
+                        }));
+                    }
+                }
+                Err(e) => {
+                    warn!("Telemetry config send failed: {e:#}");
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+        }
+        HostCommand::Fault(req, reply_tx) => match req {
+            FaultRequest::Query => {
+                let _ = reply_tx.send(Ok(FaultResponse::Snapshot(latest_fault_snap.clone())));
+            }
+            FaultRequest::Clear(keyed) => {
+                let (clear_all, category) = match keyed.inner.target {
+                    FaultClearTarget::All => (true, ProtoFaultCategory::None),
+                    FaultClearTarget::Category(cat) => (false, cat.into()),
+                };
+                let msg = WireMessage {
+                    payload: Some(Payload::FaultClear(FaultClearRequest {
+                        expected_generation: keyed.inner.expected_generation,
+                        clear_all,
+                        category: EnumValue::Known(category),
+                        unknown_fields: UnknownFields::empty(),
+                    })),
+                    unknown_fields: UnknownFields::empty(),
+                };
+                match link.send_wire_message(&msg).await {
+                    Ok(()) => {
+                        *latest_fault_snap = FaultSnapshot {
+                            generation: latest_fault_snap.generation.wrapping_add(1),
+                            faults: heapless::Vec::new(),
+                            total: 0,
+                        };
+                        let _ = reply_tx.send(Ok(FaultResponse::Cleared {
+                            req_id: keyed.id,
+                            snapshot: latest_fault_snap.clone(),
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                    }
+                }
+            }
+        },
+        HostCommand::ConfigRead(group_id, reply_tx) => {
+            let _ = reply_tx.send(Ok(ConfigResponse::Snapshot(
+                config_store.snapshot(group_id),
+            )));
+        }
+        HostCommand::ConfigApply(request, reply_tx) => {
+            let _ = reply_tx.send(Ok(config_store.apply(request)));
+        }
+        HostCommand::ConfigPersist(request, reply_tx) => {
+            let _ = reply_tx.send(Ok(config_store.persist(request)));
+        }
+        HostCommand::ConfigResetAll(reply_tx) => {
+            let _ = reply_tx.send(Ok(config_store.reset_all()));
+        }
+        HostCommand::Detect(_req, reply_tx) => {
+            let _ = reply_tx.send(Ok(DetectResponse::Error(DetectError::MotorNotResponding)));
         }
     }
 }
 
-/// `Address` packs losslessly into a `u32` (net << 16 | node << 8 | port) —
-/// the shared resolved-controller cell is a lock-free `AtomicU32`.
-fn pack_addr(a: Address) -> u32 {
+fn pack_addr(a: DeviceAddress) -> u32 {
     (u32::from(a.network_id) << 16) | (u32::from(a.node_id) << 8) | u32::from(a.port_id)
 }
 
-fn unpack_addr(v: u32) -> Address {
-    Address {
+fn unpack_addr(v: u32) -> DeviceAddress {
+    DeviceAddress {
         network_id: (v >> 16) as u16,
         node_id: (v >> 8) as u8,
         port_id: v as u8,
     }
 }
 
-fn spawn_protocol_tasks<NS>(stack: &NS, ctx: BackendCtx)
-where
-    NS: NetStackHandle + Clone + Send + Sync + 'static,
-    NS::Mutex: Send + Sync,
-    NS::Profile: Send,
-    NS::Target: Send + Sync,
-{
-    spawn_fast_telemetry_subscriber(
-        stack,
-        ctx.fast_tx,
-        ctx.connected.clone(),
-        ctx.cancel.clone(),
-    );
-    spawn_fault_topic_subscriber(
-        stack,
-        ctx.fault_sink.clone(),
-        ctx.connected.clone(),
-        ctx.cancel.clone(),
-    );
-    spawn_slow_telemetry_poller(
-        stack,
-        ctx.slow_tx,
-        ctx.fault_sink,
-        ctx.connected.clone(),
-        ctx.device_addr.clone(),
-        ctx.cancel.clone(),
-    );
-
-    // Command handler + command-staleness affirmation, in ONE task so every
-    // send is strictly ordered: an affirm of the previous setpoint can never
-    // be in flight concurrently with a fresh command (in particular a Stop)
-    // and land after it on the wire.
-    //
-    // Affirmation: while connected with a drive setpoint active, resend it
-    // every AFFIRM_INTERVAL so the device's ISR deadman stays fed (absent
-    // that, the device fail-safes after ~150 ms). The setpoint is idempotent
-    // (MotorEndpoint is `Idempotent`), so re-sending the same absolute value
-    // is safe. Fire-and-forget (no retry).
-    //
-    // On disconnect the setpoint is dropped: a reconnect must never resurrect
-    // a stale throttle — the device latches its failsafe and waits for an
-    // explicit Stopped + fresh user intent, and we must not fight that.
-    //
-    // Known trade-off of the single task: a long-running command (a 60 s
-    // Detect, a config op on a struggling link) starves affirms, so the
-    // device fail-safes. That is the safe direction — those ops don't run
-    // while riding (the device refuses them with the motor running), and a
-    // link bad enough to stall a 2 s setpoint send *should* trip the deadman.
-    tokio::spawn({
-        let stack = stack.clone();
-        let fast_hz_flag = ctx.fast_hz;
-        let requested_fast_hz = ctx.requested_fast_hz;
-        let device_addr = ctx.device_addr.clone();
-        let connected = ctx.connected.clone();
-        let cancel = ctx.cancel.clone();
-        let mut cmd_rx = ctx.cmd_rx;
-        async move {
-            let drive_session = new_drive_session();
-            let mut motor_seq = 0u32;
-            let mut active_setpoint: Option<ControlMode> = None;
-            let mut ticker = tokio::time::interval(AFFIRM_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Deadman-margin diagnostics (2026-07-06 trips): the device saw
-            // ≥150 ms of command silence while the RTT writer thread showed a
-            // matching inter-write gap — the frames stopped ARRIVING from
-            // this task. Separate the two remaining suspects: a late tick
-            // (task/runtime stall) vs a slow send (stack stall inside
-            // at_least_once).
-            let mut last_affirm_tick: Option<Instant> = None;
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    cmd = cmd_rx.recv() => {
-                        let Some(cmd) = cmd else { break };
-                        if !connected.load(Ordering::Relaxed) {
-                            active_setpoint = None;
-                            reject_unverified_command(cmd);
-                            continue;
-                        }
-                        handle_command(
-                            &stack,
-                            cmd,
-                            &fast_hz_flag,
-                            &requested_fast_hz,
-                            unpack_addr(device_addr.load(Ordering::Relaxed)),
-                            &mut active_setpoint,
-                            drive_session,
-                            &mut motor_seq,
-                        ).await;
-                    }
-                    _ = ticker.tick() => {
-                        if let Some(prev) = last_affirm_tick {
-                            let gap = prev.elapsed();
-                            if gap > Duration::from_millis(80) {
-                                tracing::warn!("affirm tick late: gap={gap:?}");
-                            }
-                        }
-                        last_affirm_tick = Some(Instant::now());
-                        if !connected.load(Ordering::Relaxed) {
-                            if active_setpoint.take().is_some() {
-                                tracing::info!(
-                                    "link down: dropping active setpoint (no auto-resume on reconnect)"
-                                );
-                            }
-                            continue;
-                        }
-                        if let Some(mode) = active_setpoint {
-                            // Truly fire-and-forget: the send is committed by
-                            // `send_request` before the response future is
-                            // returned (ordered with commands —
-                            // the destination socket name is "motor", the
-                            // device's motor server; `Some("affirm")` once
-                            // pointed at a nonexistent socket and every
-                            // affirm was silently dropped). The response wait
-                            // is detached and swallowed — awaiting it here
-                            // (even with a 40-150 ms budget) let one slow
-                            // round-trip delay the NEXT affirm past the
-                            // device's 150 ms deadman. The device-side
-                            // `stale_max_us` counter is the margin meter.
-                            let request = next_motor_request(
-                                drive_session,
-                                &mut motor_seq,
-                                MotorCommand::SetMode(mode),
-                            );
-                            let addr = unpack_addr(device_addr.load(Ordering::Relaxed));
-                            match send_motor_now(&stack, request, addr) {
-                                Err(e) => {
-                                    tracing::warn!("setpoint affirm send failed: {e:?}");
-                                }
-                                Ok(fut) => {
-                                    tokio::spawn(async move {
-                                        match tokio::time::timeout(Duration::from_secs(1), fut)
-                                            .await
-                                        {
-                                            Ok(Ok(_)) => {}
-                                            Ok(Err(e)) => {
-                                                tracing::debug!("affirm response error: {e:?}");
-                                            }
-                                            Err(_) => {
-                                                tracing::debug!("affirm response timed out");
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn spawn_fast_telemetry_subscriber<NS>(
-    stack: &NS,
-    fast_tx: Sender<FastTelemetry>,
-    connected: Arc<AtomicBool>,
-    cancel: CancellationToken,
-) where
-    NS: NetStackHandle + Clone + Send + Sync + 'static,
-    NS::Mutex: Send + Sync,
-    NS::Profile: Send,
-    NS::Target: Send,
-{
-    tokio::spawn({
-        let stack = stack.clone();
-        async move {
-            let ns = stack.stack();
-            let receiver = ns
-                .topics()
-                // Raw-Pod batches have one fixed capacity (FAST_BATCH_BYTES in
-                // core) shared by both ends — no per-side sizing to mismatch.
-                .heap_bounded_receiver::<FastTelemetryTopic>(128, Some("fast_telem"));
-            let mut pinned = pin!(receiver);
-            let mut hdl = pinned.as_mut().subscribe();
-            info!("Fast telemetry subscriber started");
-            // 1 Hz pipeline diagnostics: batches/samples that reached this
-            // subscriber vs samples dropped on a full fast_tx. Attributes
-            // capture loss to "above the socket" (batches missing here) or
-            // "below" (channel drops) without a debugger.
-            use std::time::{Duration, Instant};
-            let mut batches: u64 = 0;
-            let mut samples_ok: u64 = 0;
-            let mut dropped: u64 = 0;
-            let mut last_report = Instant::now();
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    msg = hdl.recv() => {
-                        if !connected.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        batches += 1;
-                        for sample in msg.t.samples() {
-                            // try_send: drop-on-full is the right semantics
-                            // for telemetry. A blocking send would park this
-                            // tokio worker whenever the UI stops draining
-                            // (e.g. minimized window stops the render loop).
-                            match fast_tx.try_send(sample) {
-                                Ok(()) => samples_ok += 1,
-                                Err(_) => dropped += 1,
-                            }
-                        }
-                        if last_report.elapsed() >= Duration::from_secs(1) {
-                            info!(
-                                "fast_telem/s: batches={batches} samples={samples_ok} chan_drops={dropped}"
-                            );
-                            batches = 0;
-                            samples_ok = 0;
-                            dropped = 0;
-                            last_report = Instant::now();
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn spawn_fault_topic_subscriber<NS>(
-    stack: &NS,
-    fault_sink: FaultSnapshotSink,
-    connected: Arc<AtomicBool>,
-    cancel: CancellationToken,
-) where
-    NS: NetStackHandle + Clone + Send + Sync + 'static,
-    NS::Mutex: Send + Sync,
-    NS::Profile: Send,
-    NS::Target: Send,
-{
-    tokio::spawn({
-        let stack = stack.clone();
-        async move {
-            let ns = stack.stack();
-            let receiver = ns
-                .topics()
-                .heap_bounded_receiver::<FaultTopic>(16, Some("faults"));
-            let mut pinned = pin!(receiver);
-            let mut hdl = pinned.as_mut().subscribe();
-            info!("Fault topic subscriber started");
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    msg = hdl.recv() => {
-                        if connected.load(Ordering::Relaxed) {
-                            fault_sink.offer(msg.t.clone());
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// Refuse every externally visible command until HardwareInfo has passed the
-/// bootstrap/version/UUID checks. An interface can be Active for several
-/// round trips before that handshake completes; sending during that window
-/// could otherwise mutate a different USB controller before UUID mismatch is
-/// detected.
 fn reject_unverified_command(cmd: HostCommand) {
     let error = || anyhow::anyhow!("device is not connected and identity-verified");
     match cmd {
@@ -944,388 +1071,6 @@ fn reject_unverified_command(cmd: HostCommand) {
     }
 }
 
-fn spawn_slow_telemetry_poller<NS>(
-    stack: &NS,
-    slow_tx: Sender<SlowTelemetry>,
-    fault_sink: FaultSnapshotSink,
-    connected: Arc<AtomicBool>,
-    device_addr: Arc<AtomicU32>,
-    cancel: CancellationToken,
-) where
-    NS: NetStackHandle + Clone + Send + Sync + 'static,
-    NS::Mutex: Send + Sync,
-    NS::Profile: Send,
-    NS::Target: Send,
-{
-    tokio::spawn({
-        let stack = stack.clone();
-        async move {
-            let ns = stack.stack();
-
-            // Wait for initial connection
-            while !connected.load(Ordering::Relaxed) {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                }
-            }
-
-            info!("Slow telemetry polling started (10Hz)");
-            let mut ticker = tokio::time::interval(Duration::from_millis(100));
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = ticker.tick() => {
-                        if !connected.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        let fut = ns.endpoints()
-                            .request::<SlowTelemetryEndpoint>(
-                                unpack_addr(device_addr.load(Ordering::Relaxed)),
-                                &(),
-                                Some("slow_telem"),
-                            );
-                        if let Ok(Ok(sample)) = tokio::time::timeout(
-                            Duration::from_millis(500), fut
-                        ).await {
-                            // A fault topic can be dropped without changing
-                            // fault_count (payload refinement or clear+add).
-                            // The generation in the regular poll is the
-                            // reliable loss detector; query until the latest
-                            // snapshot is successfully handed to consumers.
-                            if fault_sink.needs(sample.fault_generation) {
-                                let fault_fut = ns.endpoints().request::<FaultEndpoint>(
-                                    unpack_addr(device_addr.load(Ordering::Relaxed)),
-                                    &FaultRequest::Query,
-                                    Some("fault"),
-                                );
-                                if let Ok(Ok(FaultResponse::Snapshot(snapshot))) =
-                                    tokio::time::timeout(Duration::from_millis(500), fault_fut).await
-                                {
-                                    fault_sink.offer(snapshot);
-                                }
-                            }
-                            // try_send: see fast telemetry — never block the
-                            // runtime on a slow/absent consumer.
-                            let _ = slow_tx.try_send(sample);
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// A motor-command response still in flight after the send completed.
-type MotorResponseFut = std::pin::Pin<
-    Box<dyn Future<Output = Result<MotorStatus, ergot::net_stack::ReqRespError>> + Send>,
->;
-
-/// Send a `MotorEndpoint` request NOW and hand back the pending response.
-///
-/// Ergot's split request API commits the frame synchronously, then hands the
-/// owned response socket to this future. Sends therefore stay strictly ordered
-/// by call order within the command task, while the caller observes the
-/// response OUT of that task so response latency cannot stall the affirm
-/// ticker.
-///
-/// Why this exists (2026-07-06 deadman hunt): the drive-`Start` used to be
-/// awaited inline in the command/affirm `select!` loop. At drive engage the
-/// device-side round-trip inflates to ~100-150 ms (thread-mode latency under
-/// the telemetry stream), the first affirm was delayed by exactly that
-/// round-trip, and the device's 150 ms deadman tripped stochastically
-/// (~2/3 of spins that afternoon). The dropped 70 s inline retry is not
-/// missed: for drive modes the 50 ms affirm cadence IS the retry, and for
-/// stop-class commands a lost frame ends in the deadman failsafe stopping
-/// the motor — the correct direction.
-fn send_motor_now<NS>(
-    ns: &NS,
-    request: MotorRequest,
-    device_addr: Address,
-) -> Result<MotorResponseFut, ergot::net_stack::ReqRespError>
-where
-    NS: NetStackHandle + Clone + Send + Sync + 'static,
-    NS::Mutex: Send + Sync,
-    NS::Profile: Send,
-    NS::Target: Send + Sync,
-{
-    let client =
-        ergot::socket::endpoint::single::Client::<MotorEndpoint, NS>::new(ns.clone(), None);
-    let mut client = Box::pin(client).attach_boxed();
-    client.send_request(device_addr, &request, Some("motor"))?;
-    Ok(Box::pin(async move {
-        match client.recv().await {
-            Ok(response) => Ok(response.t),
-            Err(error) => Err(ergot::net_stack::ReqRespError::Remote(error.t)),
-        }
-    }))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "flat backend dispatch; a struct would just move the names"
-)]
-async fn handle_command<NS>(
-    ns: &NS,
-    cmd: HostCommand,
-    fast_hz_flag: &Arc<AtomicU16>,
-    requested_fast_hz: &Arc<AtomicU16>,
-    device_addr: Address,
-    active_setpoint: &mut Option<ControlMode>,
-    drive_session: u64,
-    motor_seq: &mut u32,
-) where
-    NS: NetStackHandle + Clone + Send + Sync + 'static,
-    NS::Mutex: Send + Sync,
-    NS::Profile: Send,
-    NS::Target: Send + Sync,
-{
-    let client = ns.clone().reliable::<TokioTimer>();
-    match cmd {
-        HostCommand::Motor(ref mc) => {
-            // Track the active drive setpoint for the affirmation tick. A
-            // running mode must keep being re-affirmed to hold off the device
-            // deadman; Stopped/Coast/Brake clear it (safe standing states,
-            // exempt from the device deadman — no affirmation owed).
-            *active_setpoint = if matches!(
-                mc,
-                ControlMode::Stopped | ControlMode::Coast | ControlMode::Brake
-            ) {
-                None
-            } else {
-                Some(*mc)
-            };
-            tracing::info!("Sending motor command: {:?}", mc);
-            // Send inline (ordered), observe the response detached — the
-            // await must not hold up this select! loop, or the affirm ticker
-            // starves and the device deadman fires (see send_motor_now).
-            let request = next_motor_request(drive_session, motor_seq, MotorCommand::SetMode(*mc));
-            match send_motor_now(ns, request, device_addr) {
-                Err(e) => tracing::warn!("Motor command send failed: {:?}", e),
-                Ok(fut) => {
-                    tokio::spawn(async move {
-                        match tokio::time::timeout(MOTOR_RESPONSE_TIMEOUT, fut).await {
-                            Ok(Ok(status)) => tracing::info!("Motor response: {:?}", status),
-                            Ok(Err(e)) => tracing::warn!("Motor command failed: {:?}", e),
-                            Err(_) => tracing::warn!("Motor response lost (sent, no reply)"),
-                        }
-                    });
-                }
-            }
-        }
-        HostCommand::MotorAck(ref mc, reply_tx) => {
-            // Same as Motor (incl. the affirmation tracking), but the caller
-            // gets the device status / delivery error back — a CLI must not
-            // print "sent" and exit 0 when nothing was delivered. The
-            // response wait is detached like Motor's; a lost response
-            // surfaces to the caller as an error after MOTOR_RESPONSE_TIMEOUT.
-            //
-            // The old clear-active_setpoint-on-failure is gone deliberately:
-            // failure now means "no reply", not "70 s of retries exhausted".
-            // The affirm keeps re-sending the human's commanded value — if
-            // the original frame was lost, the next affirm IS the command
-            // (idempotent); if the LINK is dead, the affirms die with it and
-            // the device deadman stops the motor. Disconnect still drops the
-            // setpoint in the ticker arm.
-            *active_setpoint = if matches!(
-                mc,
-                ControlMode::Stopped | ControlMode::Coast | ControlMode::Brake
-            ) {
-                None
-            } else {
-                Some(*mc)
-            };
-            tracing::info!("Sending motor command (acked): {:?}", mc);
-            let request = next_motor_request(drive_session, motor_seq, MotorCommand::SetMode(*mc));
-            match send_motor_now(ns, request, device_addr) {
-                Err(error) => {
-                    let _ = reply_tx.send(Err(anyhow::anyhow!("{error:?}")));
-                }
-                Ok(fut) => {
-                    tokio::spawn(async move {
-                        let res = match tokio::time::timeout(MOTOR_RESPONSE_TIMEOUT, fut).await {
-                            Ok(Ok(status)) if status.outcome.is_success() => Ok(status),
-                            Ok(Ok(status)) => Err(anyhow::anyhow!(
-                                "motor command rejected: {:?}",
-                                status.outcome
-                            )),
-                            Ok(Err(e)) => Err(anyhow::anyhow!("{e:?}")),
-                            Err(_) => Err(anyhow::anyhow!(
-                                "motor response lost (sent, no reply in {MOTOR_RESPONSE_TIMEOUT:?})"
-                            )),
-                        };
-                        let _ = reply_tx.send(res);
-                    });
-                }
-            }
-        }
-        HostCommand::EmergencyStop(reply_tx) => {
-            // Safety commands clear the local affirm immediately, before the
-            // frame is sent, so an older throttle can never follow it.
-            *active_setpoint = None;
-            let request = next_motor_request(drive_session, motor_seq, MotorCommand::EmergencyStop);
-            tracing::warn!("Sending emergency stop");
-            match send_motor_now(ns, request, device_addr) {
-                Err(error) => {
-                    let _ = reply_tx.send(Err(anyhow::anyhow!("{error:?}")));
-                }
-                Ok(fut) => {
-                    tokio::spawn(async move {
-                        let result = match tokio::time::timeout(MOTOR_RESPONSE_TIMEOUT, fut).await {
-                            Ok(Ok(status)) if status.outcome.is_success() => Ok(status),
-                            Ok(Ok(status)) => Err(anyhow::anyhow!(
-                                "emergency stop rejected: {:?}",
-                                status.outcome
-                            )),
-                            Ok(Err(error)) => Err(anyhow::anyhow!("{error:?}")),
-                            Err(_) => Err(anyhow::anyhow!(
-                                "emergency stop response lost (sent, no reply in {MOTOR_RESPONSE_TIMEOUT:?})"
-                            )),
-                        };
-                        let _ = reply_tx.send(result);
-                    });
-                }
-            }
-        }
-        HostCommand::SetPhaseSource(source) => {
-            tracing::info!("Setting phase source: {:?}", source);
-            match client
-                .at_least_once::<PhaseSourceEndpoint>(
-                    device_addr,
-                    &source,
-                    Some("phase_source"),
-                    &SETPOINT_POLICY,
-                )
-                .await
-            {
-                Ok(ack) => tracing::info!("Phase source response: {:?}", ack),
-                Err(e) => tracing::warn!("Phase source command failed: {:?}", e),
-            }
-        }
-        HostCommand::SetTelemetryConfig(cfg, reply) => {
-            tracing::info!("Setting telemetry config: {:?}", cfg);
-            // Remember the *requested* rate as the reconnect intent — the
-            // reconnect path re-applies it instead of the static config
-            // value (which used to silently kill a capture's stream after
-            // a mid-capture reconnect).
-            requested_fast_hz.store(cfg.fast_hz, Ordering::Relaxed);
-            match client
-                .at_least_once::<TelemetryConfigEndpoint>(
-                    device_addr,
-                    &cfg,
-                    Some("telemetry_config"),
-                    &SETPOINT_POLICY,
-                )
-                .await
-            {
-                Ok(ack) => {
-                    tracing::info!("Telemetry config ack: fast={}Hz", ack.actual_fast_hz);
-                    fast_hz_flag.store(ack.actual_fast_hz, Ordering::Relaxed);
-                    if let Some(reply) = reply {
-                        let _ = reply.send(Ok(ack));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Telemetry config failed: {:?}", e);
-                    if let Some(reply) = reply {
-                        let _ = reply.send(Err(anyhow!("{e:?}")));
-                    }
-                }
-            }
-        }
-        HostCommand::ConfigRead(group_id, reply_tx) => {
-            use oxifoc_core::types::ConfigRequest;
-            tracing::info!("Reading config group: {:?}", group_id);
-            let req = ConfigRequest::Read(group_id);
-            let res = client
-                .at_least_once::<ConfigEndpoint>(
-                    device_addr,
-                    &req,
-                    Some("config"),
-                    &SETPOINT_POLICY,
-                )
-                .await;
-            let _ = reply_tx.send(res.map_err(|e| anyhow::anyhow!("{e:?}")));
-        }
-        HostCommand::ConfigApply(request, reply_tx) => {
-            use oxifoc_core::types::ConfigRequest;
-            tracing::info!("Applying volatile config: {:?}", request.inner.write);
-            let req = ConfigRequest::Apply(request);
-            let res = client
-                .at_least_once::<ConfigEndpoint>(
-                    device_addr,
-                    &req,
-                    Some("config"),
-                    &SETPOINT_POLICY,
-                )
-                .await;
-            let _ = reply_tx.send(res.map_err(|e| anyhow::anyhow!("{e:?}")));
-        }
-        HostCommand::ConfigPersist(request, reply_tx) => {
-            use oxifoc_core::types::ConfigRequest;
-            tracing::info!(
-                "Persisting config group {:?} at revision {}",
-                request.inner.group,
-                request.inner.expected_revision
-            );
-            let req = ConfigRequest::Persist(request);
-            let res = client
-                .at_least_once::<ConfigEndpoint>(
-                    device_addr,
-                    &req,
-                    Some("config"),
-                    &SETPOINT_POLICY,
-                )
-                .await;
-            let _ = reply_tx.send(res.map_err(|e| anyhow::anyhow!("{e:?}")));
-        }
-        HostCommand::ConfigResetAll(reply_tx) => {
-            use oxifoc_core::types::ConfigRequest;
-            tracing::info!("Resetting all config to defaults");
-            let res = client
-                .at_least_once::<ConfigEndpoint>(
-                    device_addr,
-                    &ConfigRequest::ResetAll,
-                    Some("config"),
-                    &SETPOINT_POLICY,
-                )
-                .await;
-            let _ = reply_tx.send(res.map_err(|e| anyhow::anyhow!("{e:?}")));
-        }
-        HostCommand::Fault(req, reply_tx) => {
-            tracing::info!("Fault request: {:?}", req);
-            let res = client
-                .at_least_once::<FaultEndpoint>(device_addr, &req, Some("fault"), &SETPOINT_POLICY)
-                .await;
-            let _ = reply_tx.send(res.map_err(|e| anyhow::anyhow!("{e:?}")));
-        }
-        HostCommand::Detect(req, reply_tx) => {
-            tracing::info!("Starting motor detection: {:?}", req);
-            // Detection runs up to ~60 s — spawn it off the command task so
-            // a queued Stop (and the deadman affirmations) are not stuck
-            // behind it. The device refuses to start detection with the
-            // motor running, so the lost strict ordering is harmless.
-            let client = ns.clone().reliable::<TokioTimer>();
-            tokio::spawn(async move {
-                // Effectively-once: a stable id across retries. If the (slow)
-                // response is lost, a retry returns the device's cached
-                // result instead of re-running characterization.
-                let keyed = Keyed::new(next_detect_id(), req);
-                let res = client
-                    .effectively_once::<DetectEndpoint>(
-                        device_addr,
-                        &keyed,
-                        Some("detect"),
-                        &DETECT_POLICY,
-                    )
-                    .await;
-                let result = res.map_err(|e| anyhow::anyhow!("{e:?}"));
-                let _ = reply_tx.send(result);
-            });
-        }
-    }
-}
-
 // ── Defmt decoding ───────────────────────────────────────────────────────────
 
 #[inline]
@@ -1333,17 +1078,10 @@ fn should_start_defmt(enabled: bool, already_started: bool, transport_scoped: bo
     enabled && (!already_started || transport_scoped)
 }
 
-fn start_defmt_decoder<NS>(
+fn start_rtt_defmt_decoder(
     cfg: &HostConfig,
-    stack: &NS,
-    defmt_reader: Option<Box<dyn AsyncRead + Send + Unpin>>,
-) -> Result<()>
-where
-    NS: NetStackHandle + Clone + Send + Sync + 'static,
-    NS::Mutex: Send + Sync,
-    NS::Profile: Send,
-    NS::Target: Send,
-{
+    mut defmt_rx: Box<dyn AsyncRead + Send + Unpin>,
+) -> Result<()> {
     let elf_path = resolve_elf_path(cfg)?;
     let elf_bytes =
         fs::read(&elf_path).with_context(|| format!("Failed to read ELF at {elf_path}"))?;
@@ -1351,88 +1089,50 @@ where
         .context("Parsing defmt table from ELF failed")?
         .ok_or_else(|| anyhow::anyhow!("No .defmt section in ELF; build device with defmt"))?;
 
-    if let Some(mut defmt_rx) = defmt_reader {
-        // RTT mode: read defmt frames directly from RTT channel 0
-        info!("Starting defmt decoder (RTT mode - channel 0)");
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+    info!("Starting defmt decoder (RTT mode - channel 0)");
+    let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
 
-        thread::spawn(move || {
-            let mut stream = table.new_stream_decoder();
-            while let Ok(data) = rx.recv() {
-                stream.received(&data);
-                loop {
-                    match stream.decode() {
-                        Ok(frame) => {
-                            log_defmt_frame(frame.level(), &frame.display(false));
-                        }
-                        Err(DecodeError::UnexpectedEof) => break,
-                        Err(DecodeError::Malformed) => {
-                            error!("Malformed defmt frame");
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 1024];
+    thread::spawn(move || {
+        let mut stream = table.new_stream_decoder();
+        while let Ok(data) = rx.recv() {
+            stream.received(&data);
             loop {
-                match defmt_rx.read(&mut buf).await {
-                    Ok(0) => {
-                        error!("Defmt RTT channel closed");
-                        break;
+                match stream.decode() {
+                    Ok(frame) => {
+                        log_defmt_frame(frame.level(), &frame.display(false));
                     }
-                    Ok(count) => {
-                        if tx.send(buf[..count].to_vec()).is_err() {
-                            error!("Defmt decoder thread terminated");
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Defmt RTT read error: {:?}", e);
+                    Err(DecodeError::UnexpectedEof) => break,
+                    Err(DecodeError::Malformed) => {
+                        error!("Malformed defmt frame");
                         break;
                     }
                 }
             }
-        });
-    } else {
-        // Non-RTT mode: defmt frames forwarded over ergot network
-        info!("Starting defmt decoder (ergot network mode)");
-        tokio::spawn({
-            let stack = stack.clone();
-            async move {
-                let ns = stack.stack();
-                let sub = ns
-                    .topics()
-                    .heap_bounded_receiver::<ErgotDefmtRxOwnedTopic>(32, Some("defmt"));
-                let sub = pin!(sub);
-                let mut hdl = sub.subscribe();
-                loop {
-                    let msg = hdl.recv().await;
-                    // Each network message is one COMPLETE encoder frame
-                    // (accumulated between defmt acquire/release on the
-                    // device, terminator included). `Table::decode` expects
-                    // an UNENCODED frame and reports rzcobs frames — the
-                    // default firmware encoding — as Malformed; only the
-                    // stream decoder honors the table's encoding. A fresh
-                    // per-message decoder is correct because frames never
-                    // split across messages (and it must not live across
-                    // the await: it borrows `table`).
-                    let mut stream = table.new_stream_decoder();
-                    stream.received(&msg.t.frame);
-                    match stream.decode() {
-                        Ok(frame) => {
-                            log_defmt_frame(frame.level(), &frame.display(false));
-                        }
-                        Err(DecodeError::UnexpectedEof) => error!("Unexpected EOF decoding defmt"),
-                        Err(DecodeError::Malformed) => error!("Malformed defmt frame"),
+        }
+    });
+
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 1024];
+        loop {
+            match defmt_rx.read(&mut buf).await {
+                Ok(0) => {
+                    error!("Defmt RTT channel closed");
+                    break;
+                }
+                Ok(count) => {
+                    if tx.send(buf[..count].to_vec()).is_err() {
+                        error!("Defmt decoder thread terminated");
+                        break;
                     }
                 }
+                Err(e) => {
+                    error!("Defmt RTT read error: {:?}", e);
+                    break;
+                }
             }
-        });
-    }
+        }
+    });
 
     Ok(())
 }

@@ -1,13 +1,15 @@
 //! Transport abstraction for oxifoc host communication.
 //!
 //! Provides different transport backends:
-//! - Serial (UART over USB VCP) — COBS stream
-//! - RTT (via debug probe using probe-rs) — COBS stream
-//! - TCP (for oxifoc-virtual or remote devices) — COBS stream
-//! - UDP — framed (no COBS)
-//! - USB (via nusb bulk endpoints) — framed (no COBS)
+//! - CAN / Virtual CAN (`vcan0` via UDP Multicast Virtual CAN on macOS, or Linux SocketCAN)
+//! - TCP (10-byte CAN-framed stream for `oxifoc-virtual`)
+//! - UDP (10-byte CAN-framed datagrams for `oxifoc-virtual`)
+//! - Serial (UART over USB VCP)
+//! - RTT (via debug probe using probe-rs)
+//! - USB / BLE
 
 pub mod ble;
+pub mod can;
 #[cfg(feature = "desktop")]
 pub mod rtt;
 #[cfg(feature = "desktop")]
@@ -34,7 +36,10 @@ pub enum TransportType {
     Tcp,
     /// UDP connection
     Udp,
-    /// USB bulk (via nusb, ergot device class)
+    /// CAN / Virtual CAN (`vcan0` / `can0` — UDP Multicast Virtual CAN on macOS, SocketCAN on Linux)
+    #[serde(alias = "vcan", alias = "socketcan")]
+    Can,
+    /// USB bulk
     Usb,
     /// BLE (via bluest) - default on Android
     #[cfg_attr(not(feature = "desktop"), default)]
@@ -62,22 +67,21 @@ pub enum TransportConfig {
         host: String,
         port: u16,
     },
+    Can {
+        interface: String,
+    },
     Usb,
     Ble {
         device: bluest::Device,
     },
 }
 
-/// A COBS-stream transport (TCP, serial, RTT).
-///
-/// Returns AsyncRead/AsyncWrite pairs for use with ergot's `tokio_stream` toolkit.
-/// UDP and USB use different ergot toolkits and don't go through this struct.
+/// Stream transport returning AsyncRead/AsyncWrite pairs (TCP, serial, RTT).
 pub struct CobsStreamTransport {
-    /// Reader for ergot data (device -> host)
+    /// Reader for incoming data (device -> host)
     pub reader: Box<dyn AsyncRead + Send + Unpin>,
-    /// Writer for ergot data (host -> device)
+    /// Writer for outgoing data (host -> device)
     pub writer: Box<dyn AsyncWrite + Send + Unpin>,
     /// Optional reader for defmt data (RTT mode only, channel 0).
-    /// In serial/TCP mode, defmt is forwarded over ergot network instead.
     pub defmt_reader: Option<Box<dyn AsyncRead + Send + Unpin>>,
 }

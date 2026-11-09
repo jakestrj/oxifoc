@@ -2,13 +2,13 @@
 resolver = "2"
 members = [
     "oxifoc-core",
+    "oxifoc-host-lib",
+    "oxifoc-host-cli",
     "slint-wgpu-plot",
+    "oxifoc-host-slint",
     "oxifoc-virtual",
 ]
 exclude = [
-    "oxifoc-host-lib",
-    "oxifoc-host-cli",
-    "oxifoc-host-slint",
     "oxifoc-g474",    # Different toolchain (thumbv7em-none-eabihf)
     "oxifoc-f405",    # Different toolchain (thumbv7em-none-eabihf)
     "oxifoc-bridge",  # Different toolchain (riscv32imac-unknown-none-elf, ESP32-C6)

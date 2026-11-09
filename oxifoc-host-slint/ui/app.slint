@@ -42,7 +42,7 @@ export component App inherits Window {
     in-out property <string> page: "connect";
 
     // ── Connection properties ──
-    // transport-mode: 0=Serial, 1=RTT, 2=TCP, 3=UDP, 4=USB
+    // transport-mode: 0=Serial, 1=RTT, 2=TCP, 3=UDP, 4=USB, 5=BLE, 6=CAN
     in-out property <int> transport-mode: 0;
     in property <[StandardListViewItem]> serial-ports;
     in property <[StandardListViewItem]> probes;
@@ -55,6 +55,7 @@ export component App inherits Window {
     in-out property <string> tcp-port: "2025";
     in-out property <string> udp-host: "127.0.0.1";
     in-out property <string> udp-port: "2025";
+    in-out property <string> can-interface: "vcan0";
     in property <[StandardListViewItem]> ble-devices;
     in-out property <int> selected-ble: -1;
     in-out property <bool> ble-scanning: false;
@@ -382,6 +383,11 @@ export component App inherits Window {
                     primary: root.transport-mode == 5;
                     clicked => { root.transport-mode = 5; }
                 }
+                Button {
+                    text: "CAN / vcan";
+                    primary: root.transport-mode == 6;
+                    clicked => { root.transport-mode = 6; }
+                }
             }
 
             if root.error-text != "" : Text {
@@ -625,6 +631,28 @@ export component App inherits Window {
                 }
             }
 
+            // ── CAN / vcan config ──
+            if root.transport-mode == 6 : VerticalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: "CAN / Virtual CAN Bus";
+                    font-size: 16px;
+                    font-weight: 600;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text { text: "Interface:"; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.can-interface;
+                        width: 220px;
+                    }
+                }
+            }
+
             // ── Connect button ──
             HorizontalLayout {
                 alignment: center;
@@ -638,6 +666,7 @@ export component App inherits Window {
                            : root.transport-mode == 3 ? (root.udp-host != "" && root.udp-port != "")
                            : root.transport-mode == 4 ? true // USB always enabled
                            : root.transport-mode == 5 ? root.selected-ble >= 0
+                           : root.transport-mode == 6 ? root.can-interface != ""
                            : true;
                     clicked => { root.connect-device(); }
                 }

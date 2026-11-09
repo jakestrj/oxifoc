@@ -868,6 +868,21 @@ pub fn main() {
                         ..Default::default()
                     }
                 }
+                6 => {
+                    // CAN / vcan
+                    let iface = app.get_can_interface().to_string();
+                    if iface.trim().is_empty() {
+                        app.set_error_text("CAN interface required".into());
+                        return;
+                    }
+                    HostConfig {
+                        transport: Some(TransportType::Can),
+                        can_interface: Some(iface),
+                        stream_defmt: Some(false),
+                        stream_ergot: Some(true),
+                        ..Default::default()
+                    }
+                }
                 _ => return,
             };
 

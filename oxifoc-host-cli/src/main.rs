@@ -95,6 +95,8 @@ enum Transport {
     Rtt,
     Tcp,
     Udp,
+    #[value(alias = "vcan", alias = "socketcan")]
+    Can,
     Usb,
     /// BLE (NUS framing); the device is selected by a pre-connect scan —
     /// narrow it with --ble-name when more than one is in range
@@ -231,6 +233,10 @@ struct Cli {
     /// UDP port (for UDP transport, default: 2025)
     #[arg(long)]
     udp_port: Option<u16>,
+
+    /// CAN / Virtual CAN interface name (for can/vcan transport, default: vcan0)
+    #[arg(short, long)]
+    can_interface: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -937,6 +943,7 @@ fn build_config(cli: &Cli) -> Result<HostConfig> {
             Transport::Rtt => TransportType::Rtt,
             Transport::Tcp => TransportType::Tcp,
             Transport::Udp => TransportType::Udp,
+            Transport::Can => TransportType::Can,
             Transport::Usb => TransportType::Usb,
             Transport::Ble => TransportType::Ble,
         });
@@ -1010,6 +1017,10 @@ fn build_config(cli: &Cli) -> Result<HostConfig> {
 
     if let Some(port) = cli.udp_port {
         cfg.udp_port = Some(port);
+    }
+
+    if let Some(ref iface) = cli.can_interface {
+        cfg.can_interface = Some(iface.clone());
     }
 
     Ok(cfg)

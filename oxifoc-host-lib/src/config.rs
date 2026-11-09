@@ -28,6 +28,9 @@ pub struct HostConfig {
     pub udp_host: Option<String>, // e.g. "127.0.0.1"
     pub udp_port: Option<u16>,    // e.g. 2025
 
+    // CAN / vcan transport options
+    pub can_interface: Option<String>, // e.g. "vcan0"
+
     // BLE transport options
     /// Bluest device handle (set programmatically from scan results, not from config file)
     #[serde(skip)]
@@ -141,6 +144,12 @@ impl HostConfig {
                     .clone()
                     .unwrap_or_else(|| "127.0.0.1".to_string()),
                 port: self.udp_port.unwrap_or(2025),
+            }),
+            TransportType::Can => Ok(TransportConfig::Can {
+                interface: self
+                    .can_interface
+                    .clone()
+                    .unwrap_or_else(|| "vcan0".to_string()),
             }),
             TransportType::Usb => Ok(TransportConfig::Usb),
             TransportType::Ble => {
