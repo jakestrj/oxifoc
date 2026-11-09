@@ -13,6 +13,7 @@ mod configuration;
 mod detection;
 mod faults;
 mod logging;
+pub mod mcap;
 mod motor;
 mod presets;
 
@@ -174,6 +175,7 @@ pub fn main() {
 
     // ── Shared state ──────────────────────────────────────────────────────────
     let runtime: Arc<std::sync::Mutex<Option<HostRuntime>>> = Arc::new(std::sync::Mutex::new(None));
+    let mcap_recorder: mcap::SharedMcapRecorder = Arc::new(std::sync::Mutex::new(None));
     let motor_request_generation = Arc::new(AtomicU64::new(0));
     let stop_adc = Arc::new(AtomicBool::new(false));
 
@@ -679,6 +681,7 @@ pub fn main() {
         let conn_flag = connected_flag.clone();
         let esl_connect = enrich_slot.clone();
         let fhz = fast_hz.clone();
+        let mcap_rec = mcap_recorder.clone();
 
         app.on_connect_device(move || {
             let app = weak.unwrap();
@@ -720,6 +723,7 @@ pub fn main() {
             let slow_rx = host_runtime.slow_rx.clone();
             let info_rx = host_runtime.device_info_rx.clone();
             let fault_rx = host_runtime.fault_rx.clone();
+            let wire_rx = host_runtime.wire_rx.clone();
             let connected = host_runtime.connected.clone();
             let runtime_fast_hz = host_runtime.fast_hz.clone();
             *rt.lock().unwrap() = Some(host_runtime);
@@ -745,6 +749,30 @@ pub fn main() {
                     thread::sleep(Duration::from_millis(100));
                 }
             });
+
+            // WireMessage MCAP logger listener — continuously drains wire_rx so
+            // stale frames never accumulate while recording is off, and writes
+            // each TX/RX WireMessage into the active MCAP file when recording.
+            {
+                let stop_w = stop.clone();
+                let mcap_w = mcap_rec.clone();
+                thread::spawn(move || {
+                    while !stop_w.load(Ordering::Relaxed) {
+                        match wire_rx.recv_timeout(Duration::from_millis(200)) {
+                            Ok(msg) => {
+                                if let Ok(mut guard) = mcap_w.lock()
+                                    && let Some(ref mut rec) = *guard
+                                    && let Err(e) = rec.write_message(msg.timestamp_ns, &msg.data)
+                                {
+                                    tracing::error!("MCAP write failed: {e}");
+                                }
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                });
+            }
 
             // Fault listener — the device pushes a full snapshot on every
             // registry change (raise / refine / clear); mirror it into the UI
@@ -858,6 +886,7 @@ pub fn main() {
         let frx_slot = fast_rx_slot.clone();
         let srx_slot = slow_rx_slot.clone();
         let conn_flag = connected_flag.clone();
+        let mcap_rec = mcap_recorder.clone();
         app.on_disconnect_device(move || {
             stop.store(true, Ordering::Relaxed);
             conn_flag.store(false, Ordering::Relaxed);
@@ -867,6 +896,7 @@ pub fn main() {
                 runtime.shutdown();
             }
             let app = weak.unwrap();
+            mcap::stop_recording(&mcap_rec, Some(&app));
             app.set_page("connect".into());
             app.set_is_connected(false);
             // The device's link-loss failsafe stops (and latches) the motor
@@ -887,10 +917,12 @@ pub fn main() {
     configuration::bind(&app, &runtime);
     detection::bind(&app, &runtime);
     faults::bind(&app, &runtime);
+    mcap::bind(&app, &mcap_recorder);
 
     app.run().unwrap();
 
     stop_adc.store(true, Ordering::Relaxed);
+    mcap::stop_recording(&mcap_recorder, None);
     if let Some(rt) = runtime.lock().unwrap().take() {
         rt.shutdown();
     }

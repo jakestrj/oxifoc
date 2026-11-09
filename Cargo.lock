@@ -4234,9 +4234,13 @@ dependencies = [
 name = "oxifoc-host-slint"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "crc32fast",
  "crossbeam-channel",
+ "femtopb",
  "oxifoc-core",
  "oxifoc-host-lib",
+ "protox",
  "slint",
  "slint-build",
  "slint-wgpu-plot",

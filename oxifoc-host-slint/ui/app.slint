@@ -139,6 +139,12 @@ export component App inherits Window {
     callback stream-start();
     callback stream-stop();
 
+    // ── MCAP wire message logging ──
+    in property <bool> mcap-recording: false;
+    in property <string> mcap-status: "";
+    callback mcap-start();
+    callback mcap-stop();
+
     // ── Telemetry (formatted strings from Rust) ──
     in property <string> ia-text:   "0";
     in property <string> ib-text:   "0";
@@ -520,6 +526,20 @@ export component App inherits Window {
                     current-index <=> root.phase-source-index;
                     min-width: 124px;
                     selected => { root.phase-source-changed(); }
+                }
+                Text { text: "MCAP"; color: root.muted-text; vertical-alignment: center; }
+                Button {
+                    text: root.mcap-recording ? "Stop Rec" : "Record";
+                    primary: !root.mcap-recording;
+                    enabled: root.is-connected || root.mcap-recording;
+                    clicked => { if root.mcap-recording { root.mcap-stop(); } else { root.mcap-start(); } }
+                }
+                if root.mcap-status != "" : Text {
+                    text: root.mcap-status;
+                    color: root.mcap-recording ? #239e75 : root.muted-text;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
                 }
                 Rectangle { horizontal-stretch: 1; }
                 Button { text: "Monitor"; primary: root.active-tab == 0; clicked => { root.active-tab = 0; } }

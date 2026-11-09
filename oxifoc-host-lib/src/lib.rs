@@ -4,6 +4,7 @@ pub mod ops;
 pub mod transport;
 
 use connection::CanFrameLink;
+pub use connection::encode_wire_message_proto;
 #[cfg(test)]
 use connection::protocol_is_compatible;
 
@@ -204,11 +205,21 @@ pub enum HostCommand {
 /// Sender half of the host→backend command channel.
 pub type CommandSender = tokio::sync::mpsc::UnboundedSender<HostCommand>;
 
+/// A protobuf-encoded `oxifoc.WireMessage` observed on the link (TX or RX).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoggedWireMessage {
+    /// Timestamp in nanoseconds since the UNIX epoch when the message was sent or received.
+    pub timestamp_ns: u64,
+    /// Protobuf-encoded `oxifoc.WireMessage` payload bytes.
+    pub data: Vec<u8>,
+}
+
 pub struct HostRuntime {
     pub fast_rx: Receiver<FastTelemetry>,
     pub slow_rx: Receiver<SlowTelemetry>,
     pub fault_rx: Receiver<FaultSnapshot>,
     pub device_info_rx: Receiver<HardwareInfo>,
+    pub wire_rx: Receiver<LoggedWireMessage>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<HostCommand>,
     pub connected: Arc<AtomicBool>,
     pub fast_hz: Arc<AtomicU16>,
@@ -310,6 +321,7 @@ struct BackendCtx {
     slow_tx: Sender<SlowTelemetry>,
     fault_sink: FaultSnapshotSink,
     info_tx: Sender<HardwareInfo>,
+    wire_tx: Sender<LoggedWireMessage>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HostCommand>,
     connected: Arc<AtomicBool>,
     fast_hz: Arc<AtomicU16>,
@@ -367,6 +379,7 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
     let (slow_tx, slow_rx) = crossbeam_channel::bounded::<SlowTelemetry>(64);
     let (fault_tx, fault_rx) = crossbeam_channel::bounded::<FaultSnapshot>(64);
     let (info_tx, device_info_rx) = crossbeam_channel::bounded::<HardwareInfo>(4);
+    let (wire_tx, wire_rx) = crossbeam_channel::bounded::<LoggedWireMessage>(4096);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HostCommand>();
     let connected = Arc::new(AtomicBool::new(false));
     let fast_hz = Arc::new(AtomicU16::new(0));
@@ -378,6 +391,7 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
         slow_tx,
         fault_sink: FaultSnapshotSink::new(fault_tx),
         info_tx,
+        wire_tx,
         cmd_rx,
         connected: connected.clone(),
         fast_hz: fast_hz.clone(),
@@ -398,6 +412,7 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
         slow_rx,
         fault_rx,
         device_info_rx,
+        wire_rx,
         cmd_tx,
         connected,
         fast_hz,
@@ -409,11 +424,14 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
 
 // ── Backend dispatch ─────────────────────────────────────────────────────────
 
-fn open_can_link(transport_config: &TransportConfig) -> Result<CanFrameLink> {
+fn open_can_link(
+    transport_config: &TransportConfig,
+    wire_tx: Sender<LoggedWireMessage>,
+) -> Result<CanFrameLink> {
     match transport_config {
         TransportConfig::Can { interface } => {
             let ep = transport::can::connect(interface)?;
-            Ok(CanFrameLink::new(ep))
+            Ok(CanFrameLink::new(ep, wire_tx))
         }
     }
 }
@@ -594,7 +612,7 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
         if ctx.cancel.is_cancelled() {
             break;
         }
-        let link_res = open_can_link(&transport_config);
+        let link_res = open_can_link(&transport_config, ctx.wire_tx.clone());
 
         let mut link = match link_res {
             Ok(l) => l,
@@ -663,6 +681,10 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
                                 info!("CAN device link active (RX=0x7ED, TX=0x7E5)");
                             }
                             let decoded = nmea_rx.push_frame_with(&data, |proto| {
+                                let _ = ctx.wire_tx.try_send(LoggedWireMessage {
+                                    timestamp_ns: connection::unix_timestamp_ns(),
+                                    data: encode_wire_message_proto(proto),
+                                });
                                 match proto.payload.as_ref() {
                                     Some(Payload::SlowTelemetry(s)) => {
                                         Ok(DecodedCanMessage::Slow(SlowTelemetry::from(s)))

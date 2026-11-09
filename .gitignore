@@ -23,3 +23,5 @@ oxifoc-host-tauri/src-tauri/target/
 
 # Local telemetry capture artifacts
 /captures/
+logs/
+**/logs/
