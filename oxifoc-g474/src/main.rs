@@ -31,9 +31,7 @@ mod transport;
 mod sensors;
 
 #[allow(unused_imports)]
-use hardware::{
-    AssignedResources, CanResources, HallResources, MotorResources, StorageResources,
-};
+use hardware::{AssignedResources, CanResources, HallResources, MotorResources, StorageResources};
 
 // Define platform state with our fault type
 oxifoc_core::define_platform_state!(oxifoc_core::foc::fault::StandardFault);

@@ -35,22 +35,16 @@ use std::time::Duration;
 
 use oxifoc_core::types::{ConfigResponse, ConfigValue, ControlMode, MotorState};
 use oxifoc_host_lib::{
-    BleDeviceInfo, HostCommand, HostConfig, HostRuntime, TransportType, config_channel, ops,
-    scan_ble_devices, start_host,
+    HostCommand, HostConfig, HostRuntime, TransportType, config_channel, ops, start_host,
 };
-#[cfg(feature = "desktop")]
-use oxifoc_host_lib::{ProbeInfo, SerialPortInfo, list_probes, list_serial_ports};
 use slint::wgpu_30::WGPUConfiguration;
-use slint::{
-    GraphicsAPI, Image, ModelRc, RenderingState, SharedString, StandardListViewItem, VecModel,
-};
+use slint::{GraphicsAPI, Image, ModelRc, RenderingState, SharedString, VecModel};
 use slint_wgpu_plot::{PlotBuffer, PlotConfig, PlotRenderer, required_wgpu_settings};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const CAPACITY: usize = 32768;
 const MAX_LOG_LINES: usize = 2000;
-const BAUD_RATES: [u32; 6] = [115200, 230400, 460800, 921600, 1_000_000, 2_000_000];
 
 fn cursor_readout(
     buffer: &PlotBuffer,
@@ -179,14 +173,6 @@ pub fn main() {
     }
 
     // ── Shared state ──────────────────────────────────────────────────────────
-    #[cfg(feature = "desktop")]
-    let ports_list: Arc<std::sync::Mutex<Vec<SerialPortInfo>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    #[cfg(feature = "desktop")]
-    let probes_list: Arc<std::sync::Mutex<Vec<ProbeInfo>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let ble_devices_list: Arc<std::sync::Mutex<Vec<BleDeviceInfo>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
     let runtime: Arc<std::sync::Mutex<Option<HostRuntime>>> = Arc::new(std::sync::Mutex::new(None));
     let motor_request_generation = Arc::new(AtomicU64::new(0));
     let stop_adc = Arc::new(AtomicBool::new(false));
@@ -217,11 +203,6 @@ pub fn main() {
         std::sync::Mutex<Option<crossbeam_channel::Receiver<oxifoc_core::types::SlowTelemetry>>>,
     > = Arc::new(std::sync::Mutex::new(None));
     let connected_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-
-    #[cfg(feature = "desktop")]
-    refresh_serial_ports(&app, &ports_list);
-    #[cfg(feature = "desktop")]
-    refresh_probes(&app, &probes_list);
 
     // ── Rendering notifier: creates PlotRenderers on setup, renders on every frame ──
     {
@@ -688,62 +669,9 @@ pub fn main() {
             .expect("Unable to set rendering notifier");
     }
 
-    // ── Refresh serial ports ──────────────────────────────────────────────────
-    #[cfg(feature = "desktop")]
-    {
-        let weak = app.as_weak();
-        let ports = ports_list.clone();
-        app.on_refresh_serial_ports(move || {
-            refresh_serial_ports(&weak.unwrap(), &ports);
-        });
-    }
-
-    // ── Refresh probes ────────────────────────────────────────────────────────
-    #[cfg(feature = "desktop")]
-    {
-        let weak = app.as_weak();
-        let probes = probes_list.clone();
-        app.on_refresh_probes(move || {
-            refresh_probes(&weak.unwrap(), &probes);
-        });
-    }
-
-    // ── Scan BLE ─────────────────────────────────────────────────────────────
-    {
-        let weak = app.as_weak();
-        let ble_devs = ble_devices_list.clone();
-        app.on_scan_ble(move || {
-            let weak = weak.clone();
-            let ble_devs = ble_devs.clone();
-            // Set scanning flag
-            if let Some(app) = weak.upgrade() {
-                app.set_ble_scanning(true);
-            }
-            thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let devices = rt.block_on(scan_ble_devices(Duration::from_secs(4)));
-                let items: Vec<StandardListViewItem> = devices
-                    .iter()
-                    .map(|d| SharedString::from(d.to_string()).into())
-                    .collect();
-                *ble_devs.lock().unwrap() = devices;
-                let _ = weak.upgrade_in_event_loop(move |app| {
-                    app.set_ble_devices(ModelRc::new(VecModel::from(items)));
-                    app.set_selected_ble(-1);
-                    app.set_ble_scanning(false);
-                });
-            });
-        });
-    }
-
     //── Connect device ────────────────────────────────────────────────────────
     {
         let weak = app.as_weak();
-        #[cfg(feature = "desktop")]
-        let ports = ports_list.clone();
-        #[cfg(feature = "desktop")]
-        let probes = probes_list.clone();
-        let ble_devs = ble_devices_list.clone();
         let rt = runtime.clone();
         let stop = stop_adc.clone();
         let frx_slot = fast_rx_slot.clone();
@@ -756,134 +684,15 @@ pub fn main() {
             let app = weak.unwrap();
             stop.store(false, Ordering::Relaxed);
 
-            let mode = app.get_transport_mode();
-            let config = match mode {
-                #[cfg(feature = "desktop")]
-                0 => {
-                    // Serial
-                    let idx = app.get_selected_serial();
-                    let guard = ports.lock().unwrap();
-                    if idx < 0 || idx as usize >= guard.len() {
-                        app.set_error_text("No serial port selected".into());
-                        return;
-                    }
-                    let port = &guard[idx as usize];
-                    let baud = BAUD_RATES[app.get_baud_index().clamp(0, 5) as usize];
-                    HostConfig {
-                        transport: Some(TransportType::Serial),
-                        serial_path: Some(port.path.clone()),
-                        serial_baud: Some(baud),
-                        stream_defmt: Some(true),
-                        stream_ergot: Some(true),
-                        ..Default::default()
-                    }
-                }
-                #[cfg(feature = "desktop")]
-                1 => {
-                    // RTT
-                    let idx = app.get_selected_probe();
-                    let guard = probes.lock().unwrap();
-                    if idx < 0 || idx as usize >= guard.len() {
-                        app.set_error_text("No probe selected".into());
-                        return;
-                    }
-                    let probe = &guard[idx as usize];
-                    let chip = app.get_chip_name().to_string();
-                    if chip.is_empty() {
-                        app.set_error_text("Chip name required".into());
-                        return;
-                    }
-                    HostConfig {
-                        transport: Some(TransportType::Rtt),
-                        probe: Some(probe.identifier.clone()),
-                        chip: Some(chip),
-                        stream_defmt: Some(true),
-                        stream_ergot: Some(true),
-                        ..Default::default()
-                    }
-                }
-                2 => {
-                    // TCP
-                    let host = app.get_tcp_host().to_string();
-                    let port_str = app.get_tcp_port().to_string();
-                    let port: u16 = match port_str.parse() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            app.set_error_text("Invalid TCP port".into());
-                            return;
-                        }
-                    };
-                    HostConfig {
-                        transport: Some(TransportType::Tcp),
-                        tcp_host: Some(host),
-                        tcp_port: Some(port),
-                        stream_defmt: Some(true),
-                        stream_ergot: Some(true),
-                        ..Default::default()
-                    }
-                }
-                3 => {
-                    // UDP
-                    let host = app.get_udp_host().to_string();
-                    let port_str = app.get_udp_port().to_string();
-                    let port: u16 = match port_str.parse() {
-                        Ok(p) => p,
-                        Err(_) => {
-                            app.set_error_text("Invalid UDP port".into());
-                            return;
-                        }
-                    };
-                    HostConfig {
-                        transport: Some(TransportType::Udp),
-                        udp_host: Some(host),
-                        udp_port: Some(port),
-                        stream_defmt: Some(true),
-                        stream_ergot: Some(true),
-                        ..Default::default()
-                    }
-                }
-                4 => {
-                    // USB
-                    HostConfig {
-                        transport: Some(TransportType::Usb),
-                        stream_defmt: Some(true),
-                        stream_ergot: Some(true),
-                        ..Default::default()
-                    }
-                }
-                5 => {
-                    // BLE
-                    let idx = app.get_selected_ble();
-                    let guard = ble_devs.lock().unwrap();
-                    if idx < 0 || idx as usize >= guard.len() {
-                        app.set_error_text("No BLE device selected".into());
-                        return;
-                    }
-                    let device = &guard[idx as usize];
-                    HostConfig {
-                        transport: Some(TransportType::Ble),
-                        ble_device: Some(device.device.clone()),
-                        stream_defmt: Some(true),
-                        stream_ergot: Some(true),
-                        ..Default::default()
-                    }
-                }
-                6 => {
-                    // CAN / vcan
-                    let iface = app.get_can_interface().to_string();
-                    if iface.trim().is_empty() {
-                        app.set_error_text("CAN interface required".into());
-                        return;
-                    }
-                    HostConfig {
-                        transport: Some(TransportType::Can),
-                        can_interface: Some(iface),
-                        stream_defmt: Some(false),
-                        stream_ergot: Some(true),
-                        ..Default::default()
-                    }
-                }
-                _ => return,
+            let iface = app.get_can_interface().to_string();
+            if iface.trim().is_empty() {
+                app.set_error_text("CAN interface required".into());
+                return;
+            }
+            let config = HostConfig {
+                transport: Some(TransportType::Can),
+                can_interface: Some(iface),
+                ..Default::default()
             };
 
             // Set fast_hz so the backend enables telemetry at connect time
@@ -1085,42 +894,6 @@ pub fn main() {
     if let Some(rt) = runtime.lock().unwrap().take() {
         rt.shutdown();
     }
-}
-
-#[cfg(feature = "desktop")]
-fn refresh_serial_ports(app: &App, ports: &Arc<std::sync::Mutex<Vec<SerialPortInfo>>>) {
-    let usb_only = app.get_usb_only();
-    let all_ports = list_serial_ports();
-    let filtered: Vec<SerialPortInfo> = if usb_only {
-        all_ports
-            .into_iter()
-            .filter(|p| {
-                let path = p.path.to_lowercase();
-                path.contains("ttyacm") || path.contains("ttyusb") || path.contains("ttyama")
-            })
-            .collect()
-    } else {
-        all_ports
-    };
-    let items: Vec<StandardListViewItem> = filtered
-        .iter()
-        .map(|p| SharedString::from(p.to_string()).into())
-        .collect();
-    *ports.lock().unwrap() = filtered;
-    app.set_serial_ports(ModelRc::new(VecModel::from(items)));
-    app.set_selected_serial(-1);
-}
-
-#[cfg(feature = "desktop")]
-fn refresh_probes(app: &App, probes: &Arc<std::sync::Mutex<Vec<ProbeInfo>>>) {
-    let all_probes = list_probes();
-    let items: Vec<StandardListViewItem> = all_probes
-        .iter()
-        .map(|p| SharedString::from(p.to_string()).into())
-        .collect();
-    *probes.lock().unwrap() = all_probes;
-    app.set_probes(ModelRc::new(VecModel::from(items)));
-    app.set_selected_probe(-1);
 }
 
 #[cfg(test)]

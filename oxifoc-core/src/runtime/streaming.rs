@@ -224,20 +224,28 @@ pub fn sample_slow_telemetry<F: PlatformFault>(
     fault_registry: &FaultRegistry<F>,
     seq: u32,
 ) -> SlowTelemetry {
-    let (vbus_mv, fet_temp, motor_temp, board_temp, motor_state, control_mode, phase_source, derating) =
-        critical_section::with(|cs| {
-            let state = state_mutex.borrow(cs).borrow();
-            (
-                state.last_adc.vbus_mv,
-                state.last_adc.fet_temp_c_x10().unwrap_or(0),
-                state.last_adc.motor_temp_c_x10().unwrap_or(0),
-                state.last_adc.board_temp_c_x10().unwrap_or(0),
-                state.motor_state,
-                state.control_mode,
-                state.phase_source,
-                state.derating,
-            )
-        });
+    let (
+        vbus_mv,
+        fet_temp,
+        motor_temp,
+        board_temp,
+        motor_state,
+        control_mode,
+        phase_source,
+        derating,
+    ) = critical_section::with(|cs| {
+        let state = state_mutex.borrow(cs).borrow();
+        (
+            state.last_adc.vbus_mv,
+            state.last_adc.fet_temp_c_x10().unwrap_or(0),
+            state.last_adc.motor_temp_c_x10().unwrap_or(0),
+            state.last_adc.board_temp_c_x10().unwrap_or(0),
+            state.motor_state,
+            state.control_mode,
+            state.phase_source,
+            state.derating,
+        )
+    });
     SlowTelemetry {
         vbus_mv,
         fet_temp_c_x10: fet_temp,

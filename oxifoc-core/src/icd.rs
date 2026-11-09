@@ -49,7 +49,9 @@ pub const VCAN_MULTICAST_BASE_PORT: u16 = 29536;
 /// custom bus name) to a UDP port for the UDP Multicast Virtual CAN bus.
 #[must_use]
 pub fn vcan_multicast_port(can_interface: &str) -> u16 {
-    let name = can_interface.strip_prefix("mcast:").unwrap_or(can_interface);
+    let name = can_interface
+        .strip_prefix("mcast:")
+        .unwrap_or(can_interface);
     if let Some(num_str) = name
         .strip_prefix("vcan")
         .or_else(|| name.strip_prefix("can"))
@@ -278,7 +280,12 @@ impl PhaseSource {
                 req.toggle_v = toggle_v;
                 req.min_confidence = min_confidence;
             }
-            Self::Hall | Self::Encoder | Self::Observer | Self::Hfi | Self::Manual | Self::OpenLoop => {}
+            Self::Hall
+            | Self::Encoder
+            | Self::Observer
+            | Self::Hfi
+            | Self::Manual
+            | Self::OpenLoop => {}
         }
         req
     }

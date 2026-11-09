@@ -41,7 +41,9 @@ use tracing::{debug, info, warn};
 /// Resolve a CAN interface name (e.g. `"vcan0"`, `"mcast:vcan0"`, or
 /// `"239.255.79.88:29536"`) to its UDP Multicast Virtual CAN socket address.
 pub fn multicast_addr_for_interface(can_interface: &str) -> SocketAddrV4 {
-    let trimmed = can_interface.strip_prefix("mcast:").unwrap_or(can_interface);
+    let trimmed = can_interface
+        .strip_prefix("mcast:")
+        .unwrap_or(can_interface);
     if let Ok(addr) = trimmed.parse::<SocketAddrV4>() {
         return addr;
     }
@@ -126,11 +128,13 @@ async fn run_multicast(
     );
 
     // Spawn persistent background telemetry publishers (slow, fast, fault watches).
-    tokio::spawn(run_telemetry_publishers::<StandardFault, crate::TokioTimer>(
-        state_mutex,
-        fault_registry,
-        foc_freq_hz,
-    ));
+    tokio::spawn(
+        run_telemetry_publishers::<StandardFault, crate::TokioTimer>(
+            state_mutex,
+            fault_registry,
+            foc_freq_hz,
+        ),
+    );
 
     let boot_instant = Instant::now();
     let last_rx_ms = Arc::new(AtomicU64::new(0));
@@ -175,16 +179,10 @@ async fn run_multicast(
                 }
                 let arb_id = u16::from_le_bytes([buf[0], buf[1]]);
                 if arb_id == NMEA_RX_ARBITRATION_ID {
-                    last_rx_ms.store(
-                        boot_instant.elapsed().as_millis() as u64,
-                        Ordering::Relaxed,
-                    );
-                    if let Err(e) = nmea_rx.handle_frame(
-                        &buf[2..10],
-                        state_mutex,
-                        fault_registry,
-                        foc_freq_hz,
-                    ) {
+                    last_rx_ms.store(boot_instant.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    if let Err(e) =
+                        nmea_rx.handle_frame(&buf[2..10], state_mutex, fault_registry, foc_freq_hz)
+                    {
                         debug!(
                             "Virtual CAN multicast RX decode error on {can_interface} from {src_addr}: {e:?}"
                         );
@@ -252,11 +250,13 @@ mod linux_socketcan {
         let socket = Arc::new(socket);
         info!("SocketCAN server listening on {can_interface} (RX=0x7E5, TX=0x7ED)");
 
-        tokio::spawn(run_telemetry_publishers::<StandardFault, crate::TokioTimer>(
-            state_mutex,
-            fault_registry,
-            foc_freq_hz,
-        ));
+        tokio::spawn(
+            run_telemetry_publishers::<StandardFault, crate::TokioTimer>(
+                state_mutex,
+                fault_registry,
+                foc_freq_hz,
+            ),
+        );
 
         let boot_instant = Instant::now();
         let last_rx_ms = Arc::new(AtomicU64::new(0));
@@ -295,10 +295,8 @@ mod linux_socketcan {
             match socket.read_frame().await {
                 Ok(CanFrame::Data(frame)) => {
                     if Some(frame.id()) == expected_id {
-                        last_rx_ms.store(
-                            boot_instant.elapsed().as_millis() as u64,
-                            Ordering::Relaxed,
-                        );
+                        last_rx_ms
+                            .store(boot_instant.elapsed().as_millis() as u64, Ordering::Relaxed);
                         if let Err(e) = nmea_rx.handle_frame(
                             frame.data(),
                             state_mutex,
@@ -327,8 +325,8 @@ pub async fn run(
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let force_multicast = can_interface.starts_with("mcast:")
-            || can_interface.parse::<SocketAddrV4>().is_ok();
+        let force_multicast =
+            can_interface.starts_with("mcast:") || can_interface.parse::<SocketAddrV4>().is_ok();
         if !force_multicast {
             match linux_socketcan::try_open(can_interface) {
                 Ok(socket) => {

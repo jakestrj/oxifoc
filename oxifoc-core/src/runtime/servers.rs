@@ -101,26 +101,21 @@ pub async fn send_messages<T: MessageSender>(sender: &mut T) {
     };
 
     loop {
-        let msg: WireMessage<'_> = match select3(
-            slow_rx.changed(),
-            fast_rx.changed(),
-            fault_rx.changed(),
-        )
-        .await
-        {
-            Either3::First(slow) => WireMessage {
-                payload: Some(Payload::SlowTelemetry(slow.into())),
-                unknown_fields: UnknownFields::empty(),
-            },
-            Either3::Second(fast) => WireMessage {
-                payload: Some(Payload::FastTelemetry(fast.into())),
-                unknown_fields: UnknownFields::empty(),
-            },
-            Either3::Third(fault) => WireMessage {
-                payload: Some(Payload::FaultState(fault.into())),
-                unknown_fields: UnknownFields::empty(),
-            },
-        };
+        let msg: WireMessage<'_> =
+            match select3(slow_rx.changed(), fast_rx.changed(), fault_rx.changed()).await {
+                Either3::First(slow) => WireMessage {
+                    payload: Some(Payload::SlowTelemetry(slow.into())),
+                    unknown_fields: UnknownFields::empty(),
+                },
+                Either3::Second(fast) => WireMessage {
+                    payload: Some(Payload::FastTelemetry(fast.into())),
+                    unknown_fields: UnknownFields::empty(),
+                },
+                Either3::Third(fault) => WireMessage {
+                    payload: Some(Payload::FaultState(fault.into())),
+                    unknown_fields: UnknownFields::empty(),
+                },
+            };
 
         if sender.send_message(msg).await.is_ok() {
             fast_telem_stats::BCAST_OK.fetch_add(1, Ordering::Relaxed);
@@ -298,11 +293,7 @@ pub async fn run_telemetry_publishers<F: PlatformFault, T: Timer>(
     foc_freq_hz: u32,
 ) {
     join3(
-        slow_telemetry_stream::<F, T>(
-            state_mutex,
-            fault_registry,
-            DEFAULT_SLOW_TELEM_INTERVAL_MS,
-        ),
+        slow_telemetry_stream::<F, T>(state_mutex, fault_registry, DEFAULT_SLOW_TELEM_INTERVAL_MS),
         fast_telemetry_stream::<T>(foc_freq_hz),
         fault_topic_stream(fault_registry),
     )
@@ -430,19 +421,24 @@ mod tests {
 
         // Clear fault via NMEA + streaming-protocol frames
         let clear_wire = WireMessage {
-            payload: Some(Payload::FaultClear(crate::proto::oxifoc::FaultClearRequest {
-                expected_generation: 0,
-                clear_all: true,
-                category: EnumValue::Known(crate::proto::oxifoc::FaultCategory::None),
-                unknown_fields: UnknownFields::empty(),
-            })),
+            payload: Some(Payload::FaultClear(
+                crate::proto::oxifoc::FaultClearRequest {
+                    expected_generation: 0,
+                    clear_all: true,
+                    category: EnumValue::Known(crate::proto::oxifoc::FaultCategory::None),
+                    unknown_fields: UnknownFields::empty(),
+                },
+            )),
             unknown_fields: UnknownFields::empty(),
         };
         let mut nmea_tx = encode_wire_message_frames(&clear_wire).unwrap();
         let mut rx = NmeaCanReceiver::new();
         let mut handled = false;
         while let Some(frame) = nmea_tx.pop_frame() {
-            if rx.handle_frame(&frame.bytes, &state, &faults, 20_000).unwrap() {
+            if rx
+                .handle_frame(&frame.bytes, &state, &faults, 20_000)
+                .unwrap()
+            {
                 handled = true;
             }
         }
@@ -462,7 +458,10 @@ mod tests {
         let mut nmea_tx = encode_wire_message_frames(&cmd_wire).unwrap();
         let mut handled_cmd = false;
         while let Some(frame) = nmea_tx.pop_frame() {
-            if rx.handle_frame(&frame.bytes, &state, &faults, 20_000).unwrap() {
+            if rx
+                .handle_frame(&frame.bytes, &state, &faults, 20_000)
+                .unwrap()
+            {
                 handled_cmd = true;
             }
         }

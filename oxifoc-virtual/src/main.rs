@@ -1,8 +1,6 @@
 mod can_server;
 mod sim;
 mod storage;
-mod tcp_server;
-mod udp_server;
 
 pub struct TokioTimer;
 
@@ -39,8 +37,6 @@ pub const VIRTUAL_CALIB: oxifoc_core::types::BoardCalib = oxifoc_core::types::Bo
 
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum Transport {
-    Tcp,
-    Udp,
     #[value(alias = "vcan", alias = "socketcan")]
     Can,
 }
@@ -50,12 +46,9 @@ enum Transport {
 #[command(about = "Virtual motor controller with streaming-protocol and NMEA over CAN")]
 struct Args {
     /// Transport protocol
-    #[arg(short, long, default_value = "tcp")]
+    #[arg(short, long, default_value = "can")]
     transport: Transport,
-    /// Listen port (used for tcp/udp transports)
-    #[arg(short, long, default_value_t = 2025)]
-    port: u16,
-    /// SocketCAN interface name (used for can/vcan transport)
+    /// SocketCAN / Virtual CAN interface name
     #[arg(short, long, default_value = "vcan0")]
     can_interface: String,
     /// Initial fast telemetry rate in Hz (0 = disabled until host requests)
@@ -111,9 +104,8 @@ async fn main() -> anyhow::Result<()> {
             .store(period, core::sync::atomic::Ordering::Relaxed);
     }
     tracing::info!(
-        "oxifoc-virtual: {:?} port={}, can={}, foc={}Hz, fast={}Hz, batch={}, vbus={}V, pp={}, max_i={}A",
+        "oxifoc-virtual: {:?} can={}, foc={}Hz, fast={}Hz, batch={}, vbus={}V, pp={}, max_i={}A",
         args.transport,
-        args.port,
         args.can_interface,
         args.foc_freq,
         args.fast_hz,
@@ -158,14 +150,8 @@ async fn main() -> anyhow::Result<()> {
         &FAULT_REGISTRY,
     ));
 
-    // Run server (blocks on accept/recv loop)
+    // Run server (blocks on recv loop)
     match args.transport {
-        Transport::Tcp => {
-            tcp_server::run(args.port, args.foc_freq, &STATE, &FAULT_REGISTRY).await
-        }
-        Transport::Udp => {
-            udp_server::run(args.port, args.foc_freq, &STATE, &FAULT_REGISTRY).await
-        }
         Transport::Can => {
             can_server::run(&args.can_interface, args.foc_freq, &STATE, &FAULT_REGISTRY).await
         }

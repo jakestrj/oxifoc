@@ -20,8 +20,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use oxifoc_core::types::{ControlMode, FaultCategory, FaultClearTarget};
 use oxifoc_host_lib::{
-    HostCommand, HostConfig, HostRuntime, TransportType, init_tracing, list_probes,
-    list_serial_ports, motor_channel, start_host,
+    HostCommand, HostConfig, HostRuntime, TransportType, init_tracing, motor_channel, start_host,
 };
 use serde_json::json;
 
@@ -91,16 +90,8 @@ pub(crate) fn emit(json_mode: bool, value: serde_json::Value, human: String) {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Transport {
-    Serial,
-    Rtt,
-    Tcp,
-    Udp,
     #[value(alias = "vcan", alias = "socketcan")]
     Can,
-    Usb,
-    /// BLE (NUS framing); the device is selected by a pre-connect scan —
-    /// narrow it with --ble-name when more than one is in range
-    Ble,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -184,55 +175,9 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Transport type (serial or rtt). If not specified, uses config file.
+    /// Transport type (can/vcan/socketcan). If not specified, uses config file or defaults to can.
     #[arg(short, long, value_enum)]
     transport: Option<Transport>,
-
-    /// Serial port path (e.g., /dev/ttyACM0). Required for serial transport if not in config.
-    #[arg(long)]
-    serial_path: Option<String>,
-
-    /// Serial baud rate (overrides config file; default: config value, else 921600)
-    #[arg(long)]
-    baud: Option<u32>,
-
-    /// BLE device name (substring of the advertised name or device id) used
-    /// to pick the peripheral for --transport ble. With no filter, a single
-    /// named device in range is accepted; anything ambiguous is refused.
-    #[arg(long)]
-    ble_name: Option<String>,
-
-    /// Debug probe identifier (VID:PID or VID:PID:SERIAL). Required for RTT transport if not in config.
-    #[arg(long)]
-    probe: Option<String>,
-
-    /// Target chip name (e.g., STM32F405RGTx). Required for RTT transport.
-    #[arg(long)]
-    chip: Option<String>,
-
-    /// Path to the running firmware ELF (with `.defmt`). Used for defmt decoding
-    /// AND for pinning the RTT control block to its `_SEGGER_RTT` symbol. No
-    /// built-in default: required for the RTT transport (a wrong/missing ELF
-    /// pins the wrong address and the link never routes). May also come from
-    /// the `elf` key in oxifoc-host.toml (cwd) — mind which board that names.
-    #[arg(long)]
-    elf: Option<String>,
-
-    /// TCP host (for TCP transport, default: 127.0.0.1)
-    #[arg(long)]
-    tcp_host: Option<String>,
-
-    /// TCP port (for TCP transport, default: 2025)
-    #[arg(long)]
-    tcp_port: Option<u16>,
-
-    /// UDP host (for UDP transport, default: 127.0.0.1)
-    #[arg(long)]
-    udp_host: Option<String>,
-
-    /// UDP port (for UDP transport, default: 2025)
-    #[arg(long)]
-    udp_port: Option<u16>,
 
     /// CAN / Virtual CAN interface name (for can/vcan transport, default: vcan0)
     #[arg(short, long)]
@@ -244,8 +189,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List available devices (serial ports and debug probes)
-    List,
     /// Show device hardware info from the handshake
     Info,
     /// One system-health snapshot (mode, state, vbus, temps, faults, source)
@@ -544,11 +487,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
 
-    // Handle list command separately (doesn't need connection)
-    if matches!(cli.command, Command::List) {
-        return list_devices(json);
-    }
-
     // Maneuver validation is offline too.
     if let Command::Maneuver {
         action: ManeuverAction::Validate { ref file },
@@ -584,7 +522,6 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Command::List => unreachable!(), // Handled above
         Command::Info => {
             let info = record::latest_hw_info(&runtime)
                 .context("no hardware info received — device not connected?")?;
@@ -939,84 +876,8 @@ fn build_config(cli: &Cli) -> Result<HostConfig> {
     // Override with CLI arguments
     if let Some(transport) = cli.transport {
         cfg.transport = Some(match transport {
-            Transport::Serial => TransportType::Serial,
-            Transport::Rtt => TransportType::Rtt,
-            Transport::Tcp => TransportType::Tcp,
-            Transport::Udp => TransportType::Udp,
             Transport::Can => TransportType::Can,
-            Transport::Usb => TransportType::Usb,
-            Transport::Ble => TransportType::Ble,
         });
-    }
-
-    // BLE needs a live device handle: scan and pin the peripheral before
-    // the backend starts. Ambiguity is refused (mirrors the USB identity
-    // pinning) — a motor controller must not be picked by luck.
-    if cfg.transport == Some(TransportType::Ble) && cfg.ble_device.is_none() {
-        let devices = oxifoc_host_lib::scan_ble_devices_blocking(Duration::from_secs(4));
-        let matches: Vec<_> = devices
-            .iter()
-            .filter(|d| match cli.ble_name.as_deref() {
-                Some(pat) => {
-                    d.name.as_deref().is_some_and(|n| n.contains(pat)) || d.id.contains(pat)
-                }
-                None => d.name.is_some(),
-            })
-            .collect();
-        match matches.as_slice() {
-            [one] => cfg.ble_device = Some(one.device.clone()),
-            [] => bail!(
-                "no BLE device matched (scanned {} peripheral(s)); \
-                 check the device is advertising or pass --ble-name",
-                devices.len()
-            ),
-            many => bail!(
-                "ambiguous BLE selection — {} devices match, pass --ble-name:\n{}",
-                many.len(),
-                many.iter()
-                    .map(|d| format!("  {d}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ),
-        }
-    }
-
-    if let Some(ref path) = cli.serial_path {
-        cfg.serial_path = Some(path.clone());
-    }
-
-    // Only an explicitly passed --baud overrides the config file; the
-    // host-lib accessor falls back to 921600 when neither is set.
-    if let Some(baud) = cli.baud {
-        cfg.serial_baud = Some(baud);
-    }
-
-    if let Some(ref probe) = cli.probe {
-        cfg.probe = Some(probe.clone());
-    }
-
-    if let Some(ref chip) = cli.chip {
-        cfg.chip = Some(chip.clone());
-    }
-
-    if let Some(ref elf) = cli.elf {
-        cfg.elf = Some(elf.clone());
-    }
-
-    if let Some(ref host) = cli.tcp_host {
-        cfg.tcp_host = Some(host.clone());
-    }
-
-    if let Some(port) = cli.tcp_port {
-        cfg.tcp_port = Some(port);
-    }
-
-    if let Some(ref host) = cli.udp_host {
-        cfg.udp_host = Some(host.clone());
-    }
-
-    if let Some(port) = cli.udp_port {
-        cfg.udp_port = Some(port);
     }
 
     if let Some(ref iface) = cli.can_interface {
@@ -1024,75 +885,6 @@ fn build_config(cli: &Cli) -> Result<HostConfig> {
     }
 
     Ok(cfg)
-}
-
-fn list_devices(json: bool) -> Result<()> {
-    let ports = list_serial_ports();
-    let probes = list_probes();
-
-    if json {
-        let ports_json: Vec<_> = ports
-            .iter()
-            .map(|p| {
-                json!({
-                    "port": p.to_string(),
-                    "vid": p.vid,
-                    "pid": p.pid,
-                    "serial": p.serial_number,
-                    "manufacturer": p.manufacturer,
-                })
-            })
-            .collect();
-        let probes_json: Vec<_> = probes
-            .iter()
-            .map(|p| {
-                json!({
-                    "probe": p.to_string(),
-                    "identifier": p.identifier.to_string(),
-                    "serial": p.serial_number,
-                })
-            })
-            .collect();
-        println!(
-            "{:#}",
-            json!({"serial_ports": ports_json, "probes": probes_json})
-        );
-        return Ok(());
-    }
-
-    println!("=== Serial Ports ===");
-    if ports.is_empty() {
-        println!("  (none found)");
-    } else {
-        for port in ports {
-            println!("  {port}");
-            if let (Some(vid), Some(pid)) = (port.vid, port.pid) {
-                println!("    VID:PID = {vid:04x}:{pid:04x}");
-            }
-            if let Some(ref serial) = port.serial_number {
-                println!("    Serial: {serial}");
-            }
-            if let Some(ref mfr) = port.manufacturer {
-                println!("    Manufacturer: {mfr}");
-            }
-        }
-    }
-
-    println!();
-    println!("=== Debug Probes (RTT) ===");
-    if probes.is_empty() {
-        println!("  (none found)");
-    } else {
-        for probe in probes {
-            println!("  {probe}");
-            println!("    Identifier: {}", probe.identifier);
-            if let Some(ref serial) = probe.serial_number {
-                println!("    Serial: {serial}");
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

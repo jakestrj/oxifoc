@@ -839,7 +839,6 @@ dependencies = [
  "embassy-stm32",
  "embassy-sync",
  "embassy-time",
- "embedded-io-async 0.7.0",
  "heapless",
  "libm",
  "postcard-schema",

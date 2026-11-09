@@ -6,9 +6,5 @@
 pub mod servers;
 pub mod streaming;
 
-/// I/O wrappers for embedded-io-async (requires `embassy-hal` feature)
-#[cfg(feature = "embassy-hal")]
-pub mod io;
-
 pub use servers::*;
 pub use streaming::*;

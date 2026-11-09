@@ -43,7 +43,6 @@ critical-section = { version = "1.2", optional = true }
 
 # Embassy HAL support (for embassy-hal feature) — NO chip feature; consuming crate provides it
 embassy-stm32 = { version = "0.6.0", features = ["unstable-pac"], optional = true, git = "https://github.com/embassy-rs/embassy.git", rev = "98d847be57f3ea022ce05fe9b95ab3639a1e0a93" }
-embedded-io-async = { version = "0.7", optional = true }
 
 # Lock-free queue for ISR → async telemetry transfer (runtime feature)
 bbqueue = { workspace = true, optional = true }
@@ -159,8 +158,8 @@ storage = ["dep:sequential-storage", "dep:embedded-storage-async"]
 # Embassy async support (timer, current sensor calibration, hall state management)
 embassy = ["dep:embassy-time", "dep:embassy-sync", "dep:critical-section"]
 
-# Embassy HAL support (UART I/O wrappers, requires embassy-stm32 chip feature from consuming crate)
-embassy-hal = ["embassy", "dep:embassy-stm32", "dep:embedded-io-async"]
+# Embassy HAL support (requires embassy-stm32 chip feature from consuming crate)
+embassy-hal = ["embassy", "dep:embassy-stm32"]
 
 # CORDIC hardware sin/cos (requires embassy-stm32 CORDIC driver)
 cordic = ["embassy-hal", "dep:dsp-fixedpoint"]

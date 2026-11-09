@@ -42,23 +42,7 @@ export component App inherits Window {
     in-out property <string> page: "connect";
 
     // ── Connection properties ──
-    // transport-mode: 0=Serial, 1=RTT, 2=TCP, 3=UDP, 4=USB, 5=BLE, 6=CAN
-    in-out property <int> transport-mode: 0;
-    in property <[StandardListViewItem]> serial-ports;
-    in property <[StandardListViewItem]> probes;
-    in-out property <int> selected-serial: -1;
-    in-out property <int> selected-probe: -1;
-    in-out property <int> baud-index: 3;
-    in-out property <string> chip-name: "STM32G474RETx";
-    in-out property <bool> usb-only: true;
-    in-out property <string> tcp-host: "127.0.0.1";
-    in-out property <string> tcp-port: "2025";
-    in-out property <string> udp-host: "127.0.0.1";
-    in-out property <string> udp-port: "2025";
     in-out property <string> can-interface: "vcan0";
-    in property <[StandardListViewItem]> ble-devices;
-    in-out property <int> selected-ble: -1;
-    in-out property <bool> ble-scanning: false;
     in property <string> error-text: "";
 
     // ── Main page state ──
@@ -309,9 +293,6 @@ export component App inherits Window {
     callback detect-apply();
 
     // ── Callbacks ──
-    callback refresh-serial-ports();
-    callback refresh-probes();
-    callback scan-ble();
     callback connect-device();
     callback disconnect-device();
     callback motor-start();
@@ -322,9 +303,8 @@ export component App inherits Window {
     // ═══════════════════════════════════════════
     connect-page := Rectangle {
         visible: root.page == "connect";
-        width: min(parent.width - 32px, 740px);
-        height: min(parent.height - 32px,
-            root.transport-mode == 0 || root.transport-mode == 1 || root.transport-mode == 5 ? 560px : 350px);
+        width: min(parent.width - 32px, 560px);
+        height: min(parent.height - 32px, 280px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: root.panel-color;
@@ -343,51 +323,9 @@ export component App inherits Window {
                 font-weight: 700;
             }
             Text {
-                text: "Choose a transport and select the controller.";
+                text: "Select the CAN / Virtual CAN interface for the controller.";
                 font-size: 12px;
                 color: root.muted-text;
-            }
-
-            // ── Transport selector ──
-            HorizontalLayout {
-                spacing: 8px;
-                alignment: center;
-
-                Button {
-                    text: "Serial";
-                    primary: root.transport-mode == 0;
-                    clicked => { root.transport-mode = 0; }
-                }
-                Button {
-                    text: "RTT";
-                    primary: root.transport-mode == 1;
-                    clicked => { root.transport-mode = 1; }
-                }
-                Button {
-                    text: "TCP";
-                    primary: root.transport-mode == 2;
-                    clicked => { root.transport-mode = 2; }
-                }
-                Button {
-                    text: "UDP";
-                    primary: root.transport-mode == 3;
-                    clicked => { root.transport-mode = 3; }
-                }
-                Button {
-                    text: "USB";
-                    primary: root.transport-mode == 4;
-                    clicked => { root.transport-mode = 4; }
-                }
-                Button {
-                    text: "BLE";
-                    primary: root.transport-mode == 5;
-                    clicked => { root.transport-mode = 5; }
-                }
-                Button {
-                    text: "CAN / vcan";
-                    primary: root.transport-mode == 6;
-                    clicked => { root.transport-mode = 6; }
-                }
             }
 
             if root.error-text != "" : Text {
@@ -396,243 +334,8 @@ export component App inherits Window {
                 horizontal-alignment: center;
             }
 
-            // ── Serial config ──
-            if root.transport-mode == 0 : VerticalLayout {
-                spacing: 8px;
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-
-                    Text {
-                        text: "Serial Ports";
-                        font-size: 16px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
-                    CheckBox {
-                        text: "USB-Serial only";
-                        checked <=> root.usb-only;
-                        toggled => { root.refresh-serial-ports(); }
-                    }
-                    Button {
-                        text: "Refresh";
-                        clicked => { root.refresh-serial-ports(); }
-                    }
-                }
-
-                Rectangle {
-                    min-height: 160px;
-                    vertical-stretch: 1;
-                    StandardListView {
-                        width: parent.width;
-                        height: parent.height;
-                        model: root.serial-ports;
-                        current-item <=> root.selected-serial;
-                    }
-                    if root.serial-ports.length == 0 : Text {
-                        text: "No serial ports found. For the virtual motor, choose TCP.";
-                        x: 16px;
-                        y: (parent.height - self.height) / 2;
-                        width: parent.width - 32px;
-                        horizontal-alignment: center;
-                        color: root.muted-text;
-                        wrap: word-wrap;
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-
-                    Text { text: "Baud Rate:"; vertical-alignment: center; }
-                    ComboBox {
-                        model: ["115200", "230400", "460800", "921600", "1000000", "2000000"];
-                        current-index <=> root.baud-index;
-                        width: 150px;
-                    }
-                }
-            }
-
-            // ── RTT config ──
-            if root.transport-mode == 1 : VerticalLayout {
-                spacing: 8px;
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-
-                    Text {
-                        text: "Debug Probes";
-                        font-size: 16px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
-                    Button {
-                        text: "Refresh";
-                        clicked => { root.refresh-probes(); }
-                    }
-                }
-
-                Rectangle {
-                    min-height: 160px;
-                    vertical-stretch: 1;
-                    StandardListView {
-                        width: parent.width;
-                        height: parent.height;
-                        model: root.probes;
-                        current-item <=> root.selected-probe;
-                    }
-                    if root.probes.length == 0 : Text {
-                        text: "No debug probes found.";
-                        x: 16px;
-                        y: (parent.height - self.height) / 2;
-                        width: parent.width - 32px;
-                        horizontal-alignment: center;
-                        color: root.muted-text;
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-
-                    Text { text: "Target Chip:"; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.chip-name;
-                        width: 220px;
-                    }
-                }
-            }
-
-            // ── TCP config ──
-            if root.transport-mode == 2 : VerticalLayout {
-                spacing: 8px;
-
-                Text {
-                    text: "TCP Connection";
-                    font-size: 16px;
-                    font-weight: 600;
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-
-                    Text { text: "Host:"; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.tcp-host;
-                        width: 200px;
-                    }
-                    Text { text: "Port:"; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.tcp-port;
-                        width: 80px;
-                    }
-                }
-            }
-
-            // ── UDP config ──
-            if root.transport-mode == 3 : VerticalLayout {
-                spacing: 8px;
-
-                Text {
-                    text: "UDP Connection";
-                    font-size: 16px;
-                    font-weight: 600;
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-
-                    Text { text: "Host:"; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.udp-host;
-                        width: 200px;
-                    }
-                    Text { text: "Port:"; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.udp-port;
-                        width: 80px;
-                    }
-                }
-            }
-
-            // ── USB config ──
-            if root.transport-mode == 4 : VerticalLayout {
-                spacing: 8px;
-
-                Rectangle {
-                    background: root.canvas-color;
-                    border-radius: 8px;
-                    min-height: 60px;
-
-                    VerticalLayout {
-                        padding: 12px;
-                        spacing: 4px;
-                        alignment: center;
-
-                        Text {
-                            text: "USB (Auto-detect)";
-                            font-size: 15px;
-                            font-weight: 600;
-                            horizontal-alignment: center;
-                            color: Palette.foreground;
-                        }
-                        Text {
-                            text: "Requires one unambiguous ergot USB device and pins it across reconnects";
-                            horizontal-alignment: center;
-                            color: root.muted-text;
-                            wrap: word-wrap;
-                        }
-                    }
-                }
-            }
-
-            // ── BLE config ──
-            if root.transport-mode == 5 : VerticalLayout {
-                spacing: 8px;
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-
-                    Text {
-                        text: "BLE Devices";
-                        font-size: 16px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                    }
-                    Button {
-                        text: root.ble-scanning ? "Scanning..." : "Scan";
-                        enabled: !root.ble-scanning;
-                        clicked => { root.scan-ble(); }
-                    }
-                }
-
-                Rectangle {
-                    min-height: 200px;
-                    vertical-stretch: 1;
-                    StandardListView {
-                        width: parent.width;
-                        height: parent.height;
-                        model: root.ble-devices;
-                        current-item <=> root.selected-ble;
-                    }
-                    if root.ble-devices.length == 0 : Text {
-                        text: root.ble-scanning ? "Scanning for devices…" : "No BLE devices found. Press Scan to search.";
-                        x: 16px;
-                        y: (parent.height - self.height) / 2;
-                        width: parent.width - 32px;
-                        horizontal-alignment: center;
-                        color: root.muted-text;
-                    }
-                }
-            }
-
             // ── CAN / vcan config ──
-            if root.transport-mode == 6 : VerticalLayout {
+            VerticalLayout {
                 spacing: 8px;
 
                 Text {
@@ -660,14 +363,7 @@ export component App inherits Window {
                 Button {
                     text: "Connect";
                     primary: true;
-                    enabled: root.transport-mode == 0 ? root.selected-serial >= 0
-                           : root.transport-mode == 1 ? (root.selected-probe >= 0 && root.chip-name != "")
-                           : root.transport-mode == 2 ? (root.tcp-host != "" && root.tcp-port != "")
-                           : root.transport-mode == 3 ? (root.udp-host != "" && root.udp-port != "")
-                           : root.transport-mode == 4 ? true // USB always enabled
-                           : root.transport-mode == 5 ? root.selected-ble >= 0
-                           : root.transport-mode == 6 ? root.can-interface != ""
-                           : true;
+                    enabled: root.can-interface != "";
                     clicked => { root.connect-device(); }
                 }
             }

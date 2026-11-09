@@ -1,6 +1,5 @@
 pub mod config;
 mod connection;
-pub mod discovery;
 pub mod ops;
 pub mod transport;
 
@@ -8,10 +7,8 @@ use connection::CanFrameLink;
 #[cfg(test)]
 use connection::protocol_is_compatible;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
-use defmt_decoder::{DecodeError, Table};
-use defmt_parser::Level as DefmtLevel;
 use femtopb::{EnumValue, UnknownFields};
 use oxifoc_core::delivery::RetryPolicy;
 use oxifoc_core::foc::phase::PhaseSource;
@@ -36,7 +33,6 @@ use oxifoc_core::types::{
     MotorState, MotorStatus, SlowTelemetry, TelemetryConfigAck,
 };
 use std::{
-    fs,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
@@ -44,15 +40,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::io::AsyncRead;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub use config::{HostConfig, ReconnectPolicy};
-pub use discovery::{BleDeviceInfo, scan_ble_devices, scan_ble_devices_blocking};
-#[cfg(feature = "desktop")]
-pub use discovery::{ProbeInfo, SerialPortInfo, list_probes, list_serial_ports};
 pub use transport::{TransportConfig, TransportType};
 
 /// Logical address of the resolved motor controller.
@@ -75,7 +67,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Cadence at which the active drive setpoint is re-affirmed to the device.
 const AFFIRM_INTERVAL: Duration = Duration::from_millis(50);
 /// Keepalive cadence when no drive setpoint is active, keeping the device's
-/// `LIVENESS_TIMEOUT_MS` (3000 ms) refreshed and ensuring UDP/Multicast peers
+/// `LIVENESS_TIMEOUT_MS` (3000 ms) refreshed and ensuring multicast peers
 /// stay registered.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -130,16 +122,6 @@ fn next_motor_request(session: u64, seq: &mut u32, command: MotorCommand) -> Mot
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
-
-fn resolve_elf_path(cfg: &HostConfig) -> Result<String> {
-    cfg.elf.clone().ok_or_else(|| {
-        anyhow!(
-            "no firmware ELF configured — pass --elf <path-to-elf> (or set `elf` in \
-             the config file). It is required for RTT control-block pinning and \
-             defmt decoding; there is no default board."
-        )
-    })
-}
 
 pub fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -427,37 +409,11 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
 
 // ── Backend dispatch ─────────────────────────────────────────────────────────
 
-async fn open_can_link(transport_config: &TransportConfig, cfg: &HostConfig) -> Result<CanFrameLink> {
+fn open_can_link(transport_config: &TransportConfig) -> Result<CanFrameLink> {
     match transport_config {
         TransportConfig::Can { interface } => {
             let ep = transport::can::connect(interface)?;
-            Ok(CanFrameLink::Can(ep))
-        }
-        TransportConfig::Tcp { host, port } => {
-            let stream = transport::tcp::connect(host, *port).await?;
-            Ok(CanFrameLink::Stream(stream))
-        }
-        TransportConfig::Udp { host, port } => {
-            let socket = transport::udp::connect(host, *port).await?;
-            Ok(CanFrameLink::Udp(socket))
-        }
-        #[cfg(feature = "desktop")]
-        TransportConfig::Serial { path, baud } => {
-            let stream = transport::serial::connect(path, *baud)?;
-            Ok(CanFrameLink::Stream(stream))
-        }
-        #[cfg(feature = "desktop")]
-        TransportConfig::Rtt { probe, chip } => {
-            let elf = resolve_elf_path(cfg)?;
-            let stream = transport::rtt::connect(probe.as_deref(), chip, Some(&elf))?;
-            Ok(CanFrameLink::Stream(stream))
-        }
-        TransportConfig::Usb => {
-            transport::usb::connect().await?;
-            unreachable!()
-        }
-        TransportConfig::Ble { .. } => {
-            anyhow::bail!("BLE transport is not supported in CAN streaming-protocol mode")
+            Ok(CanFrameLink::new(ep))
         }
     }
 }
@@ -536,9 +492,11 @@ impl LocalConfigStore {
     fn snapshot(&self, group: ConfigGroupId) -> ConfigSnapshot {
         let idx = Self::group_index(group);
         let value = match group {
-            ConfigGroupId::MotorParams => {
-                self.runtime.motor_params.clone().map(ConfigValue::MotorParams)
-            }
+            ConfigGroupId::MotorParams => self
+                .runtime
+                .motor_params
+                .clone()
+                .map(ConfigValue::MotorParams),
             ConfigGroupId::HallCalibration => self
                 .runtime
                 .hall_calibration
@@ -557,9 +515,11 @@ impl LocalConfigStore {
                 .map(ConfigValue::VoltageLimits),
             ConfigGroupId::PwmConfig => self.runtime.pwm_config.clone().map(ConfigValue::PwmConfig),
             ConfigGroupId::PiGains => self.runtime.pi_gains.clone().map(ConfigValue::PiGains),
-            ConfigGroupId::HallTuning => {
-                self.runtime.hall_tuning.clone().map(ConfigValue::HallTuning)
-            }
+            ConfigGroupId::HallTuning => self
+                .runtime
+                .hall_tuning
+                .clone()
+                .map(ConfigValue::HallTuning),
             ConfigGroupId::Failsafe => self.runtime.failsafe.clone().map(ConfigValue::Failsafe),
             ConfigGroupId::Velocity => self.runtime.velocity.clone().map(ConfigValue::Velocity),
             ConfigGroupId::Derating => self.runtime.derating.clone().map(ConfigValue::Derating),
@@ -623,24 +583,18 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
     let transport_type = cfg.transport_type();
     info!("Oxifoc Host backend - transport: {:?}", transport_type);
 
-    if !cfg.stream_ergot() {
-        info!("stream_ergot disabled in config; backend not starting transport");
-        return Ok(());
-    }
-
     let transport_config = cfg.transport_config()?;
     let policy = cfg.reconnect_policy();
     let mut connect_attempts: u32 = 0;
-    let mut defmt_started = false;
     let mut config_store = LocalConfigStore::default();
     let drive_session = new_drive_session();
     let mut motor_seq = 1u32;
 
     loop {
-        let link_res = tokio::select! {
-            r = open_can_link(&transport_config, &cfg) => r,
-            _ = ctx.cancel.cancelled() => break,
-        };
+        if ctx.cancel.is_cancelled() {
+            break;
+        }
+        let link_res = open_can_link(&transport_config);
 
         let mut link = match link_res {
             Ok(l) => l,
@@ -662,17 +616,8 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
             }
         };
 
-        if let Some(defmt_reader) = link.take_defmt_reader()
-            && should_start_defmt(cfg.stream_defmt(), defmt_started, true)
-        {
-            match start_rtt_defmt_decoder(&cfg, defmt_reader) {
-                Ok(()) => defmt_started = true,
-                Err(e) => warn!("defmt decoder unavailable, continuing without it: {e:#}"),
-            }
-        }
-
         // Send initial TelemetryConfigRequest on 0x7E5 to wake the link and
-        // register our peer address on connectionless transports (UDP/Multicast).
+        // register our peer address on the virtual CAN bus.
         let initial_fast_hz = ctx.requested_fast_hz.load(Ordering::Relaxed);
         let init_msg = WireMessage {
             payload: Some(Payload::TelemetryConfig(TelemetryConfigRequest {
@@ -834,12 +779,6 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
     }
 
     ctx.connected.store(false, Ordering::Relaxed);
-    #[cfg(feature = "desktop")]
-    {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        transport::rtt::join_rtt_io_thread(Duration::from_secs(2));
-    }
-
     info!("Host backend shutdown complete");
     Ok(())
 }
@@ -875,9 +814,8 @@ async fn handle_can_command(
         };
         MotorStatus {
             state,
-            mode: mode_override.unwrap_or_else(|| {
-                last_slow.map_or(ControlMode::Stopped, |s| s.control_mode)
-            }),
+            mode: mode_override
+                .unwrap_or_else(|| last_slow.map_or(ControlMode::Stopped, |s| s.control_mode)),
             fault_count: last_slow.map_or(latest_fault_snap.total, |s| s.fault_count),
             outcome: MotorCommandOutcome::Applied,
         }
@@ -1071,99 +1009,14 @@ fn reject_unverified_command(cmd: HostCommand) {
     }
 }
 
-// ── Defmt decoding ───────────────────────────────────────────────────────────
-
-#[inline]
-fn should_start_defmt(enabled: bool, already_started: bool, transport_scoped: bool) -> bool {
-    enabled && (!already_started || transport_scoped)
-}
-
-fn start_rtt_defmt_decoder(
-    cfg: &HostConfig,
-    mut defmt_rx: Box<dyn AsyncRead + Send + Unpin>,
-) -> Result<()> {
-    let elf_path = resolve_elf_path(cfg)?;
-    let elf_bytes =
-        fs::read(&elf_path).with_context(|| format!("Failed to read ELF at {elf_path}"))?;
-    let table = Table::parse(&elf_bytes)
-        .context("Parsing defmt table from ELF failed")?
-        .ok_or_else(|| anyhow::anyhow!("No .defmt section in ELF; build device with defmt"))?;
-
-    info!("Starting defmt decoder (RTT mode - channel 0)");
-    let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-
-    thread::spawn(move || {
-        let mut stream = table.new_stream_decoder();
-        while let Ok(data) = rx.recv() {
-            stream.received(&data);
-            loop {
-                match stream.decode() {
-                    Ok(frame) => {
-                        log_defmt_frame(frame.level(), &frame.display(false));
-                    }
-                    Err(DecodeError::UnexpectedEof) => break,
-                    Err(DecodeError::Malformed) => {
-                        error!("Malformed defmt frame");
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 1024];
-        loop {
-            match defmt_rx.read(&mut buf).await {
-                Ok(0) => {
-                    error!("Defmt RTT channel closed");
-                    break;
-                }
-                Ok(count) => {
-                    if tx.send(buf[..count].to_vec()).is_err() {
-                        error!("Defmt decoder thread terminated");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("Defmt RTT read error: {:?}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    Ok(())
-}
-
-fn log_defmt_frame(level: Option<DefmtLevel>, msg: &impl std::fmt::Display) {
-    match level {
-        Some(DefmtLevel::Trace) => tracing::trace!(target: "device", "{}", msg),
-        Some(DefmtLevel::Debug) => tracing::debug!(target: "device", "{}", msg),
-        Some(DefmtLevel::Info) => tracing::info!(target: "device", "{}", msg),
-        Some(DefmtLevel::Warn) => tracing::warn!(target: "device", "{}", msg),
-        Some(DefmtLevel::Error) => tracing::error!(target: "device", "{}", msg),
-        None => tracing::info!(target: "device", "{}", msg),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         FaultSnapshotSink, generation_is_newer, may_retry, protocol_is_compatible,
-        reject_unverified_command, should_start_defmt,
+        reject_unverified_command,
     };
     use crate::ReconnectPolicy;
     use oxifoc_core::types::FaultSnapshot;
-
-    #[test]
-    fn transport_scoped_defmt_restarts_but_network_decoder_does_not() {
-        assert!(!should_start_defmt(false, false, true));
-        assert!(should_start_defmt(true, false, false));
-        assert!(!should_start_defmt(true, true, false));
-        assert!(should_start_defmt(true, true, true));
-    }
 
     #[test]
     fn protocol_version_must_match_exactly() {

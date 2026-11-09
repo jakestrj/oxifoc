@@ -36,28 +36,5 @@ build_targets = ["aarch64-linux-android"]
 min_sdk_version = 23
 target_sdk_version = 33
 
-[[package.metadata.android.uses_feature]]
-name = "android.hardware.bluetooth_le"
-required = true
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.BLUETOOTH_SCAN"
-min_sdk_version = 31
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.BLUETOOTH_CONNECT"
-min_sdk_version = 31
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.ACCESS_FINE_LOCATION"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.BLUETOOTH"
-max_sdk_version = 30
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.BLUETOOTH_ADMIN"
-max_sdk_version = 30
-
 [lints]
 workspace = true

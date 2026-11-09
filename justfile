@@ -1,7 +1,7 @@
 # oxifoc — FOC motor controller monorepo
 
 # Device firmware crates (excluded from workspace, different toolchain)
-device_crates := "oxifoc-g474 oxifoc-f405 oxifoc-bridge oxifoc-remote"
+device_crates := "oxifoc-g474 oxifoc-f405"
 
 # On-target test crates (run on hardware; compiled here so they don't rot)
 target_test_crates := "tests/stm32g474 tests/stm32f405"
@@ -53,7 +53,7 @@ check-device:
     # The second F405 board must not rot. Keep board artifacts in separate
     # directories so no ELF path silently changes electrical meaning.
     echo "oxifoc-f405 (vesc6-mk5): build..."
-    (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/vesc6-mk5 --no-default-features --features transport-usb,transport-uart,board-vesc6-mk5 2>&1 | filter) || exit 1
+    (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/vesc6-mk5 --no-default-features --features board-vesc6-mk5 2>&1 | filter) || exit 1
 
 # Format all code (workspace + device crates)
 fmt:
@@ -91,28 +91,12 @@ flash-f405-cf2:
 # Build Flipsky Mini V6 MK5 firmware.
 build-f405-vesc6-mk5:
     cd oxifoc-f405 && cargo build --release --target-dir target/vesc6-mk5 --no-default-features \
-        --features transport-usb,transport-uart,board-vesc6-mk5
+        --features board-vesc6-mk5
 
 # Build and flash Flipsky Mini V6 MK5 firmware.
 flash-f405-vesc6-mk5:
     cd oxifoc-f405 && cargo run --release --target-dir target/vesc6-mk5 --no-default-features \
-        --features transport-usb,transport-uart,board-vesc6-mk5
-
-# Build ESP32 bridge firmware.
-build-bridge:
-    cd oxifoc-bridge && cargo build --release
-
-# Build and flash ESP32 bridge firmware.
-flash-bridge:
-    cd oxifoc-bridge && cargo run --release
-
-# Build ESP32 remote firmware.
-build-remote:
-    cd oxifoc-remote && cargo build --release
-
-# Build and flash ESP32 remote firmware.
-flash-remote:
-    cd oxifoc-remote && cargo run --release
+        --features board-vesc6-mk5
 
 # Run host CLI with arguments
 cli *ARGS:
@@ -122,13 +106,11 @@ cli *ARGS:
 gui:
     cargo run -p oxifoc-host-slint
 
-# Run the virtual device as a TCP Router on :2025 (extra args after `virtual`)
+# Run the virtual device on Virtual CAN (extra args after `virtual`)
 virtual *ARGS:
-    cargo run -p oxifoc-virtual -- --transport tcp --port 2025 {{ ARGS }}
+    cargo run -p oxifoc-virtual -- --can-interface vcan0 {{ ARGS }}
 
-# End-to-end test: spawns the virtual Router and drives it via host-lib over
-# both TCP and UDP (HardwareInfo handshake, at_least_once Motor,
-# effectively_once Detect).
+# End-to-end test: spawns the virtual controller and drives it via host-lib over Virtual CAN.
 e2e:
     cargo test -p oxifoc-virtual --test e2e
 
@@ -149,7 +131,7 @@ size:
     measure oxifoc-g474 oxifoc-g474 memory.x target
     measure oxifoc-f405 oxifoc-f405-cf2 memory.x target/cf2
     measure oxifoc-f405 oxifoc-f405-vesc6-mk5 memory.x target/vesc6-mk5 --no-default-features \
-        --features transport-usb,transport-uart,board-vesc6-mk5
+        --features board-vesc6-mk5
 
 # Clean all build artifacts
 clean:

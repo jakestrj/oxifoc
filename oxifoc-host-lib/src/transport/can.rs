@@ -31,7 +31,9 @@ use tracing::info;
 /// `"239.255.79.88:29536"`) to its UDP Multicast Virtual CAN socket address.
 #[must_use]
 pub fn multicast_addr_for_interface(can_interface: &str) -> SocketAddrV4 {
-    let trimmed = can_interface.strip_prefix("mcast:").unwrap_or(can_interface);
+    let trimmed = can_interface
+        .strip_prefix("mcast:")
+        .unwrap_or(can_interface);
     if let Ok(addr) = trimmed.parse::<SocketAddrV4>() {
         return addr;
     }
@@ -92,8 +94,8 @@ pub enum CanEndpoint {
 pub fn connect(can_interface: &str) -> Result<CanEndpoint> {
     #[cfg(target_os = "linux")]
     {
-        let force_multicast = can_interface.starts_with("mcast:")
-            || can_interface.parse::<SocketAddrV4>().is_ok();
+        let force_multicast =
+            can_interface.starts_with("mcast:") || can_interface.parse::<SocketAddrV4>().is_ok();
         if !force_multicast {
             match socketcan::tokio::CanSocket::open(can_interface) {
                 Ok(sock) => {
