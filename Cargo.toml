@@ -64,6 +64,7 @@ femtopb-derive = { version = "0.8.0", default-features = false }
 femtopb-build = { version = "0.8.0", default-features = false }
 streaming-protocol = { git = "https://github.com/jakestrj/streaming-protocol", rev = "157cf63" }
 nmea = { git = "https://github.com/jakestrj/nmea", rev = "f882d1d" }
+pcbusb = { git = "https://github.com/haakonsmith/pcbusb-rs", rev = "91d698081f0a28f17fa5c08f4fcb90d217b0cd96" }
 tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

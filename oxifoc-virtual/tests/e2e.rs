@@ -261,6 +261,7 @@ fn e2e_host_lib_to_virtual_over_vcan_multicast() {
         can_interface: Some(can_iface),
         reconnect: Some(ReconnectPolicy::Limited(5)),
         fast_hz: Some(200),
+        ..Default::default()
     };
 
     let host = start_host(cfg);

@@ -7,8 +7,12 @@ set -euo pipefail
 
 CMD=(probe-rs run --chip STM32G474RETx "$@")
 
-if command -v script >/dev/null 2>&1; then
-  # -q: quiet; -f: flush output as it is written
+if [[ "$OSTYPE" == "darwin"* || "$OSTYPE" == *"bsd"* ]] && command -v script >/dev/null 2>&1; then
+  # macOS / BSD script: -F flushes output, command and arguments follow output file
+  script -q -F /dev/null "${CMD[@]}" \
+    | awk '{ sub(/^\[defmt\][[:space:]]*/, ""); print; fflush(); }'
+elif command -v script >/dev/null 2>&1; then
+  # Linux (util-linux script): -f flushes output, -c passes command string
   script -q -f -c "${CMD[*]}" /dev/null \
     | awk '{ sub(/^\[defmt\][[:space:]]*/, ""); print; fflush(); }'
 else

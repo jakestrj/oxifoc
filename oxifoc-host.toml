@@ -1,7 +1,10 @@
 # oxifoc-host configuration (TOML), loaded from the CURRENT DIRECTORY.
 
-# Transport type ("can")
+# Transport type ("can" or "pcan")
 transport = "can"
 
-# SocketCAN / Virtual CAN interface name (e.g. "vcan0", "can0", "mcast:vcan0")
+# Virtual CAN / SocketCAN / PCAN-USB interface name (e.g. "vcan0", "can0", "mcast:vcan0", "pcan0")
 can_interface = "vcan0"
+
+# CAN bus bitrate in bps (used for user-space USB adapters such as PCAN-USB on macOS; default: 500000)
+# can_bitrate = 500000

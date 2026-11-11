@@ -6,12 +6,15 @@ edition = "2024"
 [features]
 default = ["desktop"]
 desktop = []
+pcan = ["dep:pcbusb", "dep:nb"]
 
 [dependencies]
 oxifoc-core = { workspace = true, features = ["icd", "runtime", "storage", "delivery", "pod", "std"] }
 femtopb = { workspace = true }
 streaming-protocol = { workspace = true }
 nmea = { workspace = true }
+pcbusb = { workspace = true, optional = true }
+nb = { version = "1.1", optional = true }
 heapless = "0.9"
 socket2 = { version = "0.6.5", features = ["all"] }
 

@@ -1,15 +1,20 @@
-use crate::transport::{TransportConfig, TransportType};
+use crate::transport::{TransportConfig, TransportType, pcan};
 use anyhow::{Context, Result};
+use oxifoc_core::icd::CAN_BITRATE;
 use serde::Deserialize;
 use std::{env, fs, path::PathBuf};
 
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct HostConfig {
-    /// Transport type: "can" (default, aliases: "vcan", "socketcan")
+    /// Transport type: "can" (default, aliases: "vcan", "socketcan") or "pcan" (alias: "pcbusb")
     pub transport: Option<TransportType>,
 
-    // CAN / vcan transport options
-    pub can_interface: Option<String>, // e.g. "vcan0"
+    /// CAN / Virtual CAN / PCAN interface name (e.g. "vcan0", "can0", "pcan0")
+    pub can_interface: Option<String>,
+
+    /// CAN bus bitrate in bits per second (default: `CAN_BITRATE` = 500_000).
+    /// Used when opening user-space USB CAN adapters such as PCAN-USB on macOS.
+    pub can_bitrate: Option<u32>,
 
     /// Reconnection policy. None = use default (infinite retries)
     pub reconnect: Option<ReconnectPolicy>,
@@ -60,18 +65,40 @@ impl HostConfig {
         self.fast_hz.unwrap_or(0)
     }
 
+    pub fn can_bitrate(&self) -> u32 {
+        self.can_bitrate.unwrap_or(CAN_BITRATE)
+    }
+
     pub fn transport_type(&self) -> TransportType {
         self.transport.clone().unwrap_or_default()
     }
 
     pub fn transport_config(&self) -> Result<TransportConfig> {
+        let bitrate = self.can_bitrate();
         match self.transport_type() {
-            TransportType::Can => Ok(TransportConfig::Can {
-                interface: self
+            TransportType::Can => {
+                let interface = self
                     .can_interface
                     .clone()
-                    .unwrap_or_else(|| "vcan0".to_string()),
-            }),
+                    .unwrap_or_else(|| "vcan0".to_string());
+                if pcan::is_pcan_interface(&interface) {
+                    pcan::validate_pcan_channel(&interface)?;
+                    pcan::validate_pcan_bitrate(bitrate)?;
+                    pcan::ensure_pcan_feature_enabled()?;
+                    return Ok(TransportConfig::Pcan { interface, bitrate });
+                }
+                Ok(TransportConfig::Can { interface, bitrate })
+            }
+            TransportType::Pcan => {
+                let interface = self
+                    .can_interface
+                    .clone()
+                    .unwrap_or_else(|| pcan::DEFAULT_PCAN_INTERFACE.to_string());
+                pcan::validate_pcan_channel(&interface)?;
+                pcan::validate_pcan_bitrate(bitrate)?;
+                pcan::ensure_pcan_feature_enabled()?;
+                Ok(TransportConfig::Pcan { interface, bitrate })
+            }
         }
     }
 }
@@ -105,5 +132,37 @@ mod tests {
         let path = temp_config_path("missing");
         let err = HostConfig::from_path(path).expect_err("missing config must fail");
         assert!(err.to_string().contains("read host config"));
+    }
+
+    #[test]
+    fn pcan_toml_deserializes_with_default_and_custom_bitrate() {
+        let parsed: HostConfig = toml::from_str(
+            r#"
+            transport = "pcan"
+            can_interface = "pcan0"
+            can_bitrate = 1000000
+            "#,
+        )
+        .expect("parse pcan config");
+        assert_eq!(parsed.transport_type(), TransportType::Pcan);
+        assert_eq!(parsed.can_bitrate(), 1_000_000);
+
+        #[cfg(feature = "pcan")]
+        assert_eq!(
+            parsed.transport_config().unwrap(),
+            TransportConfig::Pcan {
+                interface: "pcan0".to_string(),
+                bitrate: 1_000_000,
+            }
+        );
+
+        #[cfg(not(feature = "pcan"))]
+        assert!(
+            parsed
+                .transport_config()
+                .unwrap_err()
+                .to_string()
+                .contains("--features pcan")
+        );
     }
 }

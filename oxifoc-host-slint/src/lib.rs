@@ -115,6 +115,26 @@ fn parse_id_target(value: &SharedString) -> Result<f32, String> {
     }
 }
 
+fn can_bitrate_from_index(index: i32) -> u32 {
+    match index {
+        0 => 125_000,
+        1 => 250_000,
+        2 => 500_000,
+        3 => 1_000_000,
+        _ => oxifoc_core::icd::CAN_BITRATE,
+    }
+}
+
+fn can_bitrate_to_index(bitrate: u32) -> i32 {
+    match bitrate {
+        125_000 => 0,
+        250_000 => 1,
+        500_000 => 2,
+        1_000_000 => 3,
+        _ => 2,
+    }
+}
+
 pub fn main() {
     // Set up tracing with both stderr output and UI channel
     let (log_tx, log_rx) = crossbeam_channel::bounded::<(String, i32)>(512);
@@ -137,6 +157,31 @@ pub fn main() {
         .expect("Failed to initialise WGPU backend");
 
     let app = App::new().unwrap();
+
+    // Pre-populate connection settings from oxifoc-host.toml when present, or
+    // default to pcan0 when built with `--features pcan`.
+    match HostConfig::load_default() {
+        Ok(Some(cfg)) => {
+            let default_iface = if cfg.transport_type() == TransportType::Pcan {
+                oxifoc_host_lib::transport::pcan::DEFAULT_PCAN_INTERFACE
+            } else {
+                "vcan0"
+            };
+            let iface = cfg.can_interface.as_deref().unwrap_or(default_iface);
+            app.set_can_interface(SharedString::from(iface));
+            app.set_can_bitrate_index(can_bitrate_to_index(cfg.can_bitrate()));
+        }
+        Ok(None) => {
+            if oxifoc_host_lib::transport::pcan::PCAN_FEATURE_ENABLED {
+                app.set_can_interface(SharedString::from(
+                    oxifoc_host_lib::transport::pcan::DEFAULT_PCAN_INTERFACE,
+                ));
+            }
+        }
+        Err(err) => {
+            tracing::warn!("Failed to load default host config: {err:#}");
+        }
+    }
 
     // ── Log + faults + gate driver models ───────────────────────────────────
     app.set_log_messages(ModelRc::new(VecModel::<LogMessage>::default()));
@@ -712,23 +757,30 @@ pub fn main() {
             let app = weak.unwrap();
             stop.store(false, Ordering::Relaxed);
 
-            let iface = app.get_can_interface().to_string();
-            if iface.trim().is_empty() {
+            let iface = app.get_can_interface().trim().to_string();
+            if iface.is_empty() {
                 app.set_error_text("CAN interface required".into());
                 return;
             }
-            let config = HostConfig {
-                transport: Some(TransportType::Can),
-                can_interface: Some(iface),
-                ..Default::default()
+            let bitrate = can_bitrate_from_index(app.get_can_bitrate_index());
+            let transport = if oxifoc_host_lib::transport::pcan::is_pcan_interface(&iface) {
+                TransportType::Pcan
+            } else {
+                TransportType::Can
             };
-
             // Set fast_hz so the backend enables telemetry at connect time
             let hz = ops::stream_rate_hz(app.get_stream_rate_index() as usize);
             let config = HostConfig {
+                transport: Some(transport),
+                can_interface: Some(iface),
+                can_bitrate: Some(bitrate),
                 fast_hz: Some(hz),
-                ..config
+                ..Default::default()
             };
+            if let Err(err) = config.transport_config() {
+                app.set_error_text(format!("{err:#}").into());
+                return;
+            }
 
             app.set_error_text("".into());
 
@@ -759,7 +811,7 @@ pub fn main() {
             *srx_slot.lock().unwrap() = Some(slow_rx);
 
             // Propagate connected + fast_hz flags for rendering notifier
-            conn_flag.store(true, Ordering::Relaxed);
+            conn_flag.store(connected.load(Ordering::Relaxed), Ordering::Relaxed);
             fhz.store(runtime_fast_hz.load(Ordering::Relaxed), Ordering::Relaxed);
 
             // Continuously propagate flags in background

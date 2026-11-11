@@ -1,9 +1,8 @@
-//! CAN / Virtual CAN (`vcan`) transport for `oxifoc-host-lib`.
+//! CAN / Virtual CAN (`vcan`) / PCAN-USB transport for `oxifoc-host-lib`.
 //!
-//! Supports two backends transparently:
-//! 1. **UDP Multicast Virtual CAN Bus** (default on macOS/Windows, and automatic
-//!    fallback on Linux when kernel `vcan` is unavailable or `mcast:<iface>` /
-//!    `<multicast_ip>:<port>` is given):
+//! Supports three backends transparently:
+//! 1. **UDP Multicast Virtual CAN Bus** (default for `vcan*` / `mcast:*` on macOS/Windows,
+//!    and automatic fallback on Linux when kernel `vcan` is unavailable):
 //!    - Joins the RFC 2365 local-scope multicast group `239.255.79.88` on a port
 //!      derived deterministically from the interface name (`vcan0` -> `29536`,
 //!      `vcan1` -> `29537`, etc.) with `SO_REUSEADDR` + `SO_REUSEPORT` and
@@ -12,6 +11,9 @@
 //!      2-byte little-endian 11-bit arbitration ID + 8-byte NMEA fast-packet payload.
 //! 2. **Linux SocketCAN** (`#[cfg(target_os = "linux")]`):
 //!    - Uses native kernel `AF_CAN` sockets (`vcan0`, `can0`, etc.) when present.
+//! 3. **PEAK-System PCAN-USB** (`#[cfg(feature = "pcan")]`):
+//!    - Uses `pcbusb` (`MacCAN` `libPCBUSB.dylib` on macOS, `PCAN-Basic` elsewhere)
+//!      for `pcan0` / `PCAN_USBBUS1` hardware interfaces without falling back to multicast.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -19,13 +21,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use oxifoc_core::icd::{
-    CAN_WIRE_FRAME_LEN, NMEA_INTER_FRAME_DELAY_MS, NMEA_RX_ARBITRATION_ID, VCAN_MULTICAST_IP,
-    vcan_multicast_port,
+    CAN_BITRATE, CAN_WIRE_FRAME_LEN, NMEA_INTER_FRAME_DELAY_MS, NMEA_RX_ARBITRATION_ID,
+    VCAN_MULTICAST_IP, vcan_multicast_port,
 };
 use oxifoc_core::proto::oxifoc::WireMessage;
 use oxifoc_core::runtime::servers::encode_wire_message_frames;
 use tokio::net::UdpSocket;
 use tracing::info;
+
+use super::pcan;
 
 /// Resolve a CAN interface name (e.g. `"vcan0"`, `"mcast:vcan0"`, or
 /// `"239.255.79.88:29536"`) to its UDP Multicast Virtual CAN socket address.
@@ -77,7 +81,7 @@ pub fn bind_multicast_can_socket(can_interface: &str) -> Result<(UdpSocket, Sock
     Ok((udp, SocketAddr::V4(mcast_addr)))
 }
 
-/// Connected CAN interface handle (either UDP Multicast Virtual CAN or Linux SocketCAN).
+/// Connected CAN interface handle (UDP Multicast Virtual CAN, Linux SocketCAN, or PCAN-USB).
 #[derive(Clone)]
 pub enum CanEndpoint {
     Multicast {
@@ -88,14 +92,43 @@ pub enum CanEndpoint {
     SocketCan {
         socket: Arc<socketcan::tokio::CanSocket>,
     },
+    #[cfg(feature = "pcan")]
+    Pcan(pcan::PcanEndpoint),
 }
 
-/// Open a CAN or Virtual CAN (`vcan`) endpoint by interface name.
+/// Open a PEAK PCAN-USB endpoint explicitly (never falls back to UDP multicast).
+pub fn connect_pcan(can_interface: &str, bitrate: u32) -> Result<CanEndpoint> {
+    pcan::validate_pcan_channel(can_interface)?;
+    pcan::validate_pcan_bitrate(bitrate)?;
+    pcan::ensure_pcan_feature_enabled()?;
+
+    #[cfg(feature = "pcan")]
+    {
+        let ep = pcan::PcanEndpoint::open(can_interface, bitrate)?;
+        Ok(CanEndpoint::Pcan(ep))
+    }
+
+    #[cfg(not(feature = "pcan"))]
+    unreachable!("ensure_pcan_feature_enabled returned Err when pcan feature is disabled")
+}
+
+/// Open a CAN or Virtual CAN (`vcan`) endpoint by interface name using [`CAN_BITRATE`].
 pub fn connect(can_interface: &str) -> Result<CanEndpoint> {
+    connect_with_bitrate(can_interface, CAN_BITRATE)
+}
+
+/// Open a CAN, Virtual CAN (`vcan`), or PCAN-USB endpoint by interface name and bitrate.
+pub fn connect_with_bitrate(can_interface: &str, bitrate: u32) -> Result<CanEndpoint> {
+    let force_multicast =
+        can_interface.starts_with("mcast:") || can_interface.parse::<SocketAddrV4>().is_ok();
+
+    // Never silently map a PCAN hardware name onto UDP Multicast Virtual CAN.
+    if !force_multicast && pcan::is_pcan_interface(can_interface) {
+        return connect_pcan(can_interface, bitrate);
+    }
+
     #[cfg(target_os = "linux")]
     {
-        let force_multicast =
-            can_interface.starts_with("mcast:") || can_interface.parse::<SocketAddrV4>().is_ok();
         if !force_multicast {
             match socketcan::tokio::CanSocket::open(can_interface) {
                 Ok(sock) => {
@@ -122,44 +155,48 @@ pub fn connect(can_interface: &str) -> Result<CanEndpoint> {
 }
 
 impl CanEndpoint {
+    async fn send_raw_frame(&self, arb_id: u16, payload: &[u8; 8]) -> Result<()> {
+        match self {
+            Self::Multicast { socket, mcast_addr } => {
+                let mut wire = [0u8; CAN_WIRE_FRAME_LEN];
+                wire[0..2].copy_from_slice(&arb_id.to_le_bytes());
+                wire[2..10].copy_from_slice(payload);
+                socket
+                    .send_to(&wire, *mcast_addr)
+                    .await
+                    .context("send virtual CAN multicast frame")?;
+            }
+            #[cfg(target_os = "linux")]
+            Self::SocketCan { socket } => {
+                use socketcan::{CanFrame, EmbeddedFrame, StandardId};
+                let std_id = StandardId::new(arb_id)
+                    .ok_or_else(|| anyhow::anyhow!("invalid CAN arbitration ID"))?;
+                let can_frame = CanFrame::new(std_id, payload)
+                    .ok_or_else(|| anyhow::anyhow!("invalid CAN frame payload"))?;
+                socket
+                    .write_frame(can_frame)
+                    .await
+                    .context("write SocketCAN frame")?;
+            }
+            #[cfg(feature = "pcan")]
+            Self::Pcan(ep) => {
+                ep.send_frame(arb_id, payload).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Encode a [`WireMessage`] with `streaming-protocol`, fragment it into 8-byte
     /// NMEA fast-packet CAN frames, and transmit each frame on `0x7E5`.
     pub async fn send_wire_message(&self, msg: &WireMessage<'_>) -> Result<()> {
         let mut nmea_msg = encode_wire_message_frames(msg)
             .map_err(|e| anyhow::anyhow!("encode wire message failed: {e:?}"))?;
 
-        match self {
-            Self::Multicast { socket, mcast_addr } => {
-                let id_bytes = NMEA_RX_ARBITRATION_ID.to_le_bytes();
-                while let Some(frame) = nmea_msg.pop_frame() {
-                    let mut wire = [0u8; CAN_WIRE_FRAME_LEN];
-                    wire[0..2].copy_from_slice(&id_bytes);
-                    wire[2..10].copy_from_slice(&frame.bytes);
-                    socket
-                        .send_to(&wire, *mcast_addr)
-                        .await
-                        .context("send virtual CAN multicast frame")?;
-                    if nmea_msg.num_frames > 1 {
-                        tokio::time::sleep(Duration::from_millis(NMEA_INTER_FRAME_DELAY_MS)).await;
-                    }
-                }
-            }
-            #[cfg(target_os = "linux")]
-            Self::SocketCan { socket } => {
-                use socketcan::{CanFrame, EmbeddedFrame, StandardId};
-                let std_id = StandardId::new(NMEA_RX_ARBITRATION_ID)
-                    .ok_or_else(|| anyhow::anyhow!("invalid CAN arbitration ID"))?;
-                while let Some(frame) = nmea_msg.pop_frame() {
-                    let can_frame = CanFrame::new(std_id, &frame.bytes)
-                        .ok_or_else(|| anyhow::anyhow!("invalid CAN frame payload"))?;
-                    socket
-                        .write_frame(can_frame)
-                        .await
-                        .context("write SocketCAN frame")?;
-                    if nmea_msg.num_frames > 1 {
-                        tokio::time::sleep(Duration::from_millis(NMEA_INTER_FRAME_DELAY_MS)).await;
-                    }
-                }
+        while let Some(frame) = nmea_msg.pop_frame() {
+            self.send_raw_frame(NMEA_RX_ARBITRATION_ID, &frame.bytes)
+                .await?;
+            if nmea_msg.num_frames > 1 {
+                tokio::time::sleep(Duration::from_millis(NMEA_INTER_FRAME_DELAY_MS)).await;
             }
         }
         Ok(())
@@ -199,6 +236,35 @@ impl CanEndpoint {
                     }
                 }
             }
+            #[cfg(feature = "pcan")]
+            Self::Pcan(ep) => ep.recv_frame().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multicast_addr_parses_explicit_and_named_interfaces() {
+        let named = multicast_addr_for_interface("vcan0");
+        assert_eq!(named.ip(), &Ipv4Addr::from(VCAN_MULTICAST_IP));
+        assert_eq!(named.port(), vcan_multicast_port("vcan0"));
+
+        let prefixed = multicast_addr_for_interface("mcast:vcan0");
+        assert_eq!(prefixed, named);
+
+        let explicit = multicast_addr_for_interface("239.255.79.88:29999");
+        assert_eq!(explicit.port(), 29999);
+    }
+
+    #[cfg(not(feature = "pcan"))]
+    #[test]
+    fn pcan_interface_does_not_silently_fallback_to_multicast_when_feature_disabled() {
+        let Err(err) = connect_with_bitrate("pcan0", CAN_BITRATE) else {
+            panic!("pcan0 must not fall back to UDP multicast");
+        };
+        assert!(err.to_string().contains("--features pcan"));
     }
 }

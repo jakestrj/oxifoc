@@ -434,12 +434,15 @@ fn open_can_link(
     transport_config: &TransportConfig,
     wire_tx: Sender<LoggedWireMessage>,
 ) -> Result<CanFrameLink> {
-    match transport_config {
-        TransportConfig::Can { interface } => {
-            let ep = transport::can::connect(interface)?;
-            Ok(CanFrameLink::new(ep, wire_tx))
+    let ep = match transport_config {
+        TransportConfig::Can { interface, bitrate } => {
+            transport::can::connect_with_bitrate(interface, *bitrate)?
         }
-    }
+        TransportConfig::Pcan { interface, bitrate } => {
+            transport::can::connect_pcan(interface, *bitrate)?
+        }
+    };
+    Ok(CanFrameLink::new(ep, wire_tx))
 }
 
 fn default_can_hardware_info() -> HardwareInfo {

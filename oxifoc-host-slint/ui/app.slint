@@ -60,6 +60,7 @@ export component App inherits Window {
 
     // ── Connection properties ──
     in-out property <string> can-interface: "vcan0";
+    in-out property <int> can-bitrate-index: 2; // 0=125k, 1=250k, 2=500k, 3=1M
     in property <string> error-text: "";
 
     // ── Main page state ──
@@ -336,7 +337,7 @@ export component App inherits Window {
     connect-page := Rectangle {
         visible: root.page == "connect";
         width: min(parent.width - 32px, 560px);
-        height: min(parent.height - 32px, 280px);
+        height: min(parent.height - 32px, 340px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: root.panel-color;
@@ -355,7 +356,7 @@ export component App inherits Window {
                 font-weight: 700;
             }
             Text {
-                text: "Select the CAN / Virtual CAN interface for the controller.";
+                text: "Select Virtual CAN (vcan0), SocketCAN (can0), or PCAN-USB (pcan0).";
                 font-size: 12px;
                 color: root.muted-text;
             }
@@ -363,15 +364,16 @@ export component App inherits Window {
             if root.error-text != "" : Text {
                 text: root.error-text;
                 color: #ef4444;
+                wrap: word-wrap;
                 horizontal-alignment: center;
             }
 
-            // ── CAN / vcan config ──
+            // ── CAN / vcan / PCAN config ──
             VerticalLayout {
                 spacing: 8px;
 
                 Text {
-                    text: "CAN / Virtual CAN Bus";
+                    text: "CAN / Virtual CAN / PCAN-USB";
                     font-size: 16px;
                     font-weight: 600;
                 }
@@ -380,10 +382,30 @@ export component App inherits Window {
                     spacing: 8px;
                     alignment: start;
 
-                    Text { text: "Interface:"; vertical-alignment: center; }
+                    Text { text: "Interface:"; width: 68px; vertical-alignment: center; }
                     LineEdit {
                         text <=> root.can-interface;
-                        width: 220px;
+                        width: 200px;
+                    }
+                    Button {
+                        text: "vcan0";
+                        clicked => { root.can-interface = "vcan0"; }
+                    }
+                    Button {
+                        text: "pcan0";
+                        clicked => { root.can-interface = "pcan0"; }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+
+                    Text { text: "Bitrate:"; width: 68px; vertical-alignment: center; }
+                    ComboBox {
+                        width: 200px;
+                        model: ["125 kbps", "250 kbps", "500 kbps", "1 Mbps"];
+                        current-index <=> root.can-bitrate-index;
                     }
                 }
             }

@@ -29,6 +29,8 @@ check-host:
     # lint gate.
     cargo clippy -p oxifoc-core --quiet --no-default-features \
         --features algorithms,runtime,storage,delivery,defmt,embassy,virtual-motor,std -- -D warnings
+    echo "host pcan feature gate (must not rot)..."
+    cargo clippy -p oxifoc-host-lib -p oxifoc-host-slint --quiet --features pcan --all-targets -- -D warnings
 
 # Device firmware: fmt + clippy + build (all targets)
 check-device:
@@ -115,6 +117,10 @@ flash-f405-jbldc:
 # Run host GUI
 gui:
     cargo run -p oxifoc-host-slint
+
+# Run host GUI with PEAK PCAN-USB support (requires MacCAN libPCBUSB on macOS)
+gui-pcan:
+    cargo run -p oxifoc-host-slint --features pcan
 
 # Run the virtual device on Virtual CAN (extra args after `virtual`)
 virtual *ARGS:
