@@ -44,7 +44,7 @@ where
     /// update, so this is a copy, not a recompute.
     #[inline(always)]
     #[cfg_attr(feature = "isr-speed", optimize(speed))]
-    fn stamp_step_telemetry(&mut self, out: &mut FocOutput) {
+    pub(super) fn stamp_step_telemetry(&mut self, out: &mut FocOutput) {
         out.velocity_rad_s = self.phase.get().velocity;
         // Debug fast-frame mapping (bench estimator forensics): repurpose
         // four columns with observer internals — velocity/erpm ← PLL ω̂

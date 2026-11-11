@@ -557,7 +557,10 @@ where
                     prof_t1,
                     crate::isr_prof::now(),
                 );
-                Ok(FocOutput::default())
+                Ok(FocOutput {
+                    angle_rad: self.phase.get().angle,
+                    ..Default::default()
+                })
             }
             ControlMode::CurrentControl {
                 iq_target,
@@ -588,9 +591,32 @@ where
                 self.pwm_off = true;
                 self.controller.reset();
                 self.update_phase_with_applied_voltage(0.0, 0.0, 0.0, 0.0, dt, now_ticks);
-                Ok(FocOutput::default())
+                Ok(FocOutput {
+                    angle_rad: self.phase.get().angle,
+                    ..Default::default()
+                })
             }
             ControlMode::Brake => self.step_park_brake(dt, now_ticks),
         }
+    }
+
+    /// Advance phase estimation while the bridge is held off by a Kill fault
+    /// (decimated ×4, matching the `Stopped` arm) and return passive telemetry
+    /// (`angle_rad` and `velocity_rad_s` from the active phase source, zero
+    /// currents/duties).
+    #[cfg_attr(feature = "isr-speed", optimize(speed))]
+    pub fn tick_stopped_telemetry(&mut self, now_ticks: u64) -> FocOutput {
+        self.stopped_housekeeping = self.stopped_housekeeping.wrapping_add(1);
+        if self.stopped_housekeeping & 0x3 == 0 {
+            self.update_phase_with_applied_voltage(0.0, 0.0, 0.0, 0.0, self.dt * 4.0, now_ticks);
+        }
+        let phase = self.phase.get();
+        self.position.update(phase.angle);
+        let mut out = FocOutput {
+            angle_rad: phase.angle,
+            ..Default::default()
+        };
+        self.stamp_step_telemetry(&mut out);
+        out
     }
 }

@@ -880,7 +880,7 @@ where
         // process_commands once the host clears the registry.
         critical_section::with(|cs| state_mutex.borrow(cs).borrow_mut().set_error());
         publish_current_offset_outcome(state_mutex, driver);
-        return None;
+        return Some(driver.tick_stopped_telemetry(now_ticks));
     }
     // GracefulStop-class: the inverter is healthy — bring the vehicle down
     // via the configured failsafe (ramp / controlled stop) instead of

@@ -6,7 +6,6 @@ use crate::foc::clamp_f32;
 #[cfg(feature = "runtime")]
 use crate::foc::config::BoardConfig;
 use crate::foc::controller::Decoupling;
-#[cfg(feature = "virtual-motor")]
 use crate::foc::controller::FocOutput;
 use crate::foc::current_offset::{CurrentOffsetMethod, CurrentOffsetRequest};
 #[cfg(feature = "virtual-motor")]
@@ -22,7 +21,9 @@ use crate::foc::transforms::{clarke, park};
 use crate::foc::velocity::VelocityLoopConfig;
 #[cfg(feature = "virtual-motor")]
 use crate::foc::wrap_angle;
-use crate::motor::derating::{DeratingConfig, DeratingScales};
+#[cfg(feature = "runtime")]
+use crate::motor::derating::DeratingConfig;
+use crate::motor::derating::DeratingScales;
 #[cfg(feature = "virtual-motor")]
 use crate::motor::failsafe::{FailsafePolicy, FailsafeTerminal};
 #[cfg(feature = "runtime")]
@@ -3418,13 +3419,54 @@ mod severity_gate {
     fn kill_fault_cuts_pwm_and_latches_error() {
         let _serial = cmd_channel_lock();
         let mut h = running_harness();
+        h.driver.phase_mut().set_manual_angle(1.25);
+        h.driver.phase_mut().set_source(PhaseSource::Manual).unwrap();
 
         h.registry.set(SevFault::OverCurrent);
-        let out = h.cycle(50);
+        let mut out = None;
+        for step in 1..=4 {
+            out = h.cycle(step * 50);
+        }
+        let out = out.expect("Kill must still publish passive sensor telemetry");
 
-        assert!(out.is_none(), "Kill must skip the FOC step");
+        assert_eq!(out.duties, [0; 3], "Kill must skip the active FOC step");
+        assert_eq!(out.vq, 0.0, "Kill must not command voltage");
+        assert!(
+            (out.angle_rad - 1.25).abs() < 1e-5,
+            "Kill must still report live phase angle: got {}",
+            out.angle_rad
+        );
         assert!(matches!(h.driver.mode(), ControlMode::Stopped));
         assert_eq!(h.motor_state(), MotorState::Error);
+    }
+
+    #[test]
+    fn stopped_and_coast_report_live_phase_angle() {
+        let _serial = cmd_channel_lock();
+        let mut h = running_harness();
+        h.driver.phase_mut().set_manual_angle(2.1);
+        h.driver.phase_mut().set_source(PhaseSource::Manual).unwrap();
+
+        h.driver.set_mode(ControlMode::Stopped);
+        let mut out_stopped = None;
+        for step in 1..=4 {
+            out_stopped = h.cycle(step * 50);
+        }
+        let out_stopped = out_stopped.expect("Stopped must return FocOutput");
+        assert!(
+            (out_stopped.angle_rad - 2.1).abs() < 1e-5,
+            "Stopped must report phase angle: got {}",
+            out_stopped.angle_rad
+        );
+
+        h.driver.phase_mut().set_manual_angle(0.75);
+        h.driver.set_mode(ControlMode::Coast);
+        let out_coast = h.cycle(250).expect("Coast must return FocOutput");
+        assert!(
+            (out_coast.angle_rad - 0.75).abs() < 1e-5,
+            "Coast must report phase angle: got {}",
+            out_coast.angle_rad
+        );
     }
 
     /// The hall bridge is STICKY: the warning lands in the registry on

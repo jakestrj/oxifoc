@@ -297,7 +297,10 @@ where
                 self.mode = ControlMode::Stopped;
                 self.failsafe_ctrl.reset();
                 self.update_phase_with_applied_voltage(0.0, 0.0, 0.0, 0.0, dt, now_ticks);
-                Ok(FocOutput::default())
+                Ok(FocOutput {
+                    angle_rad: self.phase.get().angle,
+                    ..Default::default()
+                })
             }
             // Stop with the parking-brake terminal: hand over to
             // ControlMode::Brake (see step_park_brake), starting as the
@@ -310,7 +313,10 @@ where
                 self.mode = ControlMode::Brake;
                 self.failsafe_ctrl.reset();
                 self.update_phase_with_applied_voltage(0.0, 0.0, 0.0, 0.0, dt, now_ticks);
-                Ok(FocOutput::default())
+                Ok(FocOutput {
+                    angle_rad: self.phase.get().angle,
+                    ..Default::default()
+                })
             }
         }
     }
