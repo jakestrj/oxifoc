@@ -39,7 +39,13 @@ use crate::hardware::peripherals::AdcHandles;
 use crate::safety::feed_watchdog;
 use crate::sensors::hall;
 
-use crate::config::{BOARD, CPU_HZ, NTC_BOARD, NTC_MOTOR, PWM_CONFIG};
+#[cfg(feature = "board-jbldc")]
+use crate::config::jbldc_igbt_temp_c_x10_from_adc;
+use crate::config::{BOARD, CPU_HZ, PWM_CONFIG};
+#[cfg(not(feature = "board-jbldc"))]
+use crate::config::{NTC_BOARD, NTC_MOTOR};
+#[cfg(feature = "board-jbldc")]
+use crate::hardware::eicedriver::GD_BOARD_TEMP_C_X10;
 use crate::motor::MotorPwm;
 use crate::sensors::{F405CurrentSensor, F405CurrentSensorExt, hall::HallAngleProxy};
 use crate::{FAULT_REGISTRY, STATE};
@@ -193,6 +199,7 @@ pub async fn init(
 
     // Build current sensor and phase manager
     let current_sensor = F405CurrentSensor::from_board(&BOARD, &IA_SAMPLE, &IB_SAMPLE, &IC_SAMPLE);
+    #[cfg(not(feature = "board-jbldc"))]
     hall::apply_stored_config(config);
     let hall_proxy = HallAngleProxy::new();
     let initial_vbus_v = first_vbus_v().await;
@@ -208,11 +215,17 @@ pub async fn init(
     // detection has filled motor params (before that, Manual: commutation
     // stays inert until the host drives it, and unwired hall inputs never
     // get consulted, so they can't spam HallError).
-    if !config
+    // JBLDC has no hall sensors wired (PC6/PC7 belong to EiceDRIVER WH), so
+    // it always takes the sensorless boot path regardless of flash contents.
+    #[cfg(not(feature = "board-jbldc"))]
+    let use_sensorless_boot = !config
         .hall_calibration
         .as_ref()
-        .is_some_and(oxifoc_core::storage::HallCalibrationConfig::is_calibrated)
-    {
+        .is_some_and(oxifoc_core::storage::HallCalibrationConfig::is_calibrated);
+    #[cfg(feature = "board-jbldc")]
+    let use_sensorless_boot = true;
+
+    if use_sensorless_boot {
         let boot_source = if config.motor_params.is_some() {
             PhaseSource::Observer
         } else {
@@ -366,7 +379,7 @@ fn ADC() {
     // as the g431 ISR.
     let convert_temp = *SEQ & 127 == 0;
 
-    // Read ADC1 injected data (phase A current + board temp)
+    // Read ADC1 injected data (phase A current + board/IGBT temp)
     let (ia_raw, board_temp_raw) = ADC1_INJECTED.lock(|cell| {
         if let Some(injected) = cell.borrow_mut().as_mut() {
             let mut samples = [0; 2];
@@ -378,16 +391,20 @@ fn ADC() {
     });
     IA_SAMPLE.store(ia_raw, Ordering::Relaxed);
 
-    // Convert board temperature raw ADC to 0.1°C units
-    let board_temp_c_x10 = if convert_temp {
+    // Convert FET/IGBT temperature raw ADC to 0.1°C units
+    let fet_temp_c_x10 = if convert_temp {
+        #[cfg(not(feature = "board-jbldc"))]
         let t = NTC_BOARD.temp_c_x10_from_adc(board_temp_raw, BOARD.calib.adc_max_counts);
+        #[cfg(feature = "board-jbldc")]
+        let t = jbldc_igbt_temp_c_x10_from_adc(board_temp_raw, BOARD.calib.adc_max_counts);
         BOARD_TEMP_C_X10.store(t, Ordering::Relaxed);
         t
     } else {
         BOARD_TEMP_C_X10.load(Ordering::Relaxed)
     };
 
-    // Read ADC2 injected data (phase B current + motor temp)
+    // Read ADC2 injected data (CF2/MK5: phase B current + motor temp; JBLDC: phase B current)
+    #[cfg(not(feature = "board-jbldc"))]
     let (ib_raw, motor_temp_raw) = ADC2_INJECTED.lock(|cell| {
         if let Some(injected) = cell.borrow_mut().as_mut() {
             let mut samples = [0; 2];
@@ -397,16 +414,29 @@ fn ADC() {
             (0, 0)
         }
     });
+    #[cfg(feature = "board-jbldc")]
+    let ib_raw = ADC2_INJECTED.lock(|cell| {
+        if let Some(injected) = cell.borrow_mut().as_mut() {
+            let mut samples = [0; 1];
+            injected.read_latest(&mut samples);
+            samples[0]
+        } else {
+            0
+        }
+    });
     IB_SAMPLE.store(ib_raw, Ordering::Relaxed);
 
-    MOTOR_TEMP_RAW.store(motor_temp_raw, Ordering::Relaxed);
-    // Convert motor temperature raw ADC to 0.1°C units
-    let motor_temp_c_x10 = if convert_temp {
-        let t = NTC_MOTOR.temp_c_x10_from_adc(motor_temp_raw, BOARD.calib.adc_max_counts);
-        MOTOR_TEMP_C_X10.store(t, Ordering::Relaxed);
-        t
-    } else {
-        MOTOR_TEMP_C_X10.load(Ordering::Relaxed)
+    #[cfg(not(feature = "board-jbldc"))]
+    let motor_temp_c_x10 = {
+        MOTOR_TEMP_RAW.store(motor_temp_raw, Ordering::Relaxed);
+        // Convert motor temperature raw ADC to 0.1°C units
+        if convert_temp {
+            let t = NTC_MOTOR.temp_c_x10_from_adc(motor_temp_raw, BOARD.calib.adc_max_counts);
+            MOTOR_TEMP_C_X10.store(t, Ordering::Relaxed);
+            t
+        } else {
+            MOTOR_TEMP_C_X10.load(Ordering::Relaxed)
+        }
     };
 
     // Read ADC3 injected data (phase C current + VBUS)
@@ -440,9 +470,17 @@ fn ADC() {
 
     // Build ADC snapshot
     *SEQ = SEQ.wrapping_add(1);
+    #[cfg(not(feature = "board-jbldc"))]
     let adc_snapshot = AdcSnapshot::new(ia_raw, ib_raw, ic_raw, vbus_mv, *SEQ)
-        .with_temp(TempSensorId::Fet, board_temp_c_x10)
+        .with_temp(TempSensorId::Fet, fet_temp_c_x10)
         .with_temp(TempSensorId::Motor, motor_temp_c_x10);
+    #[cfg(feature = "board-jbldc")]
+    let adc_snapshot = AdcSnapshot::new(ia_raw, ib_raw, ic_raw, vbus_mv, *SEQ)
+        .with_temp(TempSensorId::Fet, fet_temp_c_x10)
+        .with_temp(
+            TempSensorId::Board,
+            GD_BOARD_TEMP_C_X10.load(Ordering::Relaxed),
+        );
 
     // Get Hall snapshot
     let hall_snapshot = hall::get_snapshot(now_ticks);

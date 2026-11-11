@@ -17,21 +17,28 @@
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(not(feature = "board-jbldc"))]
 use embassy_stm32::gpio::Pull;
 use embassy_stm32::interrupt::typelevel::Interrupt;
+#[cfg(not(feature = "board-jbldc"))]
 use embassy_stm32::timer::input_capture::CaptureInput;
-use embassy_stm32::timer::low_level::{InputCaptureMode, InputCaptureSelection, Timer};
+use embassy_stm32::timer::low_level::Timer;
+#[cfg(not(feature = "board-jbldc"))]
+use embassy_stm32::timer::low_level::{InputCaptureMode, InputCaptureSelection};
+#[cfg(not(feature = "board-jbldc"))]
 use embassy_stm32::timer::{Ch1, Ch2, Ch3, Channel};
 use embassy_stm32::{Peri, interrupt, pac, peripherals};
 use embassy_sync::blocking_mutex::CriticalSectionMutex;
 
-use oxifoc_core::foc::capture_timebase::{CaptureTimebase, input_filter_delay_ticks};
+use oxifoc_core::foc::capture_timebase::CaptureTimebase;
+#[cfg(not(feature = "board-jbldc"))]
+use oxifoc_core::foc::capture_timebase::input_filter_delay_ticks;
 use oxifoc_core::foc::hall_embassy::{set_tick_source, update_hall_edge};
 
 // Re-export shared items from core
-pub use oxifoc_core::foc::hall_embassy::{
-    HallAngleProxy, apply_stored_config, get_snapshot, init_estimator,
-};
+#[cfg(not(feature = "board-jbldc"))]
+pub use oxifoc_core::foc::hall_embassy::apply_stored_config;
+pub use oxifoc_core::foc::hall_embassy::{HallAngleProxy, get_snapshot, init_estimator};
 
 /// Hall timebase tick rate: TIM3 counts at 1 MHz.
 pub const HALL_TICKS_PER_SEC: u64 = 1_000_000;
@@ -87,6 +94,7 @@ fn clear_flags(uif: bool, cc1of: bool) {
 }
 
 /// Initialize hall acquisition: pins to TIM3 AF, XOR + capture setup.
+#[cfg(not(feature = "board-jbldc"))]
 pub fn init_hall(
     pc6: Peri<'static, peripherals::PC6>,
     pc7: Peri<'static, peripherals::PC7>,
@@ -188,14 +196,67 @@ pub fn init_hall(
     );
 }
 
+/// Initialize TIM3 as a free-running 1 MHz µs timebase on JBLDC (sensorless-only:
+/// PC6/PC7 belong to EiceDRIVER WH `FLT_N`/`RDYC`, and hall inputs are unwired).
+#[cfg(feature = "board-jbldc")]
+pub fn init_hall(tim3: Peri<'static, peripherals::TIM3>) {
+    init_estimator(HALL_TICKS_PER_SEC);
+    set_tick_source(now_ticks);
+
+    let timer = Timer::new(tim3);
+    let clk = u64::from(timer.get_clock_frequency().0);
+    let psc = clk / HALL_TICKS_PER_SEC - 1;
+    defmt::assert!(
+        clk.is_multiple_of(HALL_TICKS_PER_SEC) && psc <= u64::from(u16::MAX),
+        "TIM3 clock {} not divisible to 1 MHz",
+        clk
+    );
+    let regs = timer.regs_gp16();
+    regs.psc().write_value(psc as u16);
+    regs.arr().write(|w| w.set_arr(0xFFFF));
+    regs.egr().write(|w| w.set_ug(true));
+    clear_flags(true, true);
+    timer.enable_update_interrupt(true);
+    timer.start();
+
+    TIM_DRIVER.lock(|cell| cell.replace(Some(timer)));
+
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "single logical operation: TIM3 1 MHz timebase IRQ bring-up"
+    )]
+    // SAFETY: one-time IRQ bring-up during init before TIM3 overflow can fire;
+    // Peripherals::steal() only touches NVIC priority registers nothing else owns here.
+    unsafe {
+        interrupt::typelevel::TIM3::unpend();
+        cortex_m::peripheral::NVIC::unmask(interrupt::TIM3);
+        let mut nvic = cortex_m::peripheral::Peripherals::steal().NVIC;
+        nvic.set_priority(interrupt::TIM3, 1 << 4);
+    }
+
+    defmt::info!(
+        "JBLDC timebase: TIM3 @ 1 MHz (clk {} Hz, psc {}, sensorless — no hall capture)",
+        clk,
+        psc
+    );
+}
+
 // ========== Fast Hall State Reading ==========
 
 /// Read Hall state from GPIOC IDR in a single register access.
 /// PC6=H1 (bit 0), PC7=H2 (bit 1), PC8=H3 (bit 2)
+#[cfg(not(feature = "board-jbldc"))]
 #[inline(always)]
 fn read_hall_idr() -> u8 {
     // Single 32-bit read, extract bits 6-8, shift to bits 0-2
     ((pac::GPIOC.idr().read().0 >> 6) & 0b111) as u8
+}
+
+/// JBLDC has no hall sensors wired (PC6/PC7 are EiceDRIVER WH pins).
+#[cfg(feature = "board-jbldc")]
+#[inline(always)]
+fn read_hall_idr() -> u8 {
+    0b111
 }
 
 /// Read raw Hall sensor state (public API for calibration).

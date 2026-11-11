@@ -50,10 +50,14 @@ check-device:
         (cd "$crate" && cargo fmt --check) || exit 1
         (cd "$crate" && cargo build --tests --quiet 2>&1 | filter) || exit 1
     done
-    # The second F405 board must not rot. Keep board artifacts in separate
+    # Non-default F405 boards must not rot. Keep board artifacts in separate
     # directories so no ELF path silently changes electrical meaning.
-    echo "oxifoc-f405 (vesc6-mk5): build..."
+    echo "oxifoc-f405 (vesc6-mk5): clippy + build..."
+    (cd oxifoc-f405 && cargo clippy --quiet --target-dir target/vesc6-mk5 --no-default-features --features board-vesc6-mk5 -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
     (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/vesc6-mk5 --no-default-features --features board-vesc6-mk5 2>&1 | filter) || exit 1
+    echo "oxifoc-f405 (jbldc): clippy + build..."
+    (cd oxifoc-f405 && cargo clippy --quiet --target-dir target/jbldc --no-default-features --features board-jbldc -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
+    (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/jbldc --no-default-features --features board-jbldc 2>&1 | filter) || exit 1
 
 # Format all code (workspace + device crates)
 fmt:
@@ -98,6 +102,16 @@ flash-f405-vesc6-mk5:
     cd oxifoc-f405 && cargo run --release --target-dir target/vesc6-mk5 --no-default-features \
         --features board-vesc6-mk5
 
+# Build JBLDC high-voltage EiceDRIVER firmware.
+build-f405-jbldc:
+    cd oxifoc-f405 && cargo build --release --target-dir target/jbldc --no-default-features \
+        --features board-jbldc
+
+# Build and flash JBLDC high-voltage EiceDRIVER firmware.
+flash-f405-jbldc:
+    cd oxifoc-f405 && cargo run --release --target-dir target/jbldc --no-default-features \
+        --features board-jbldc
+
 # Run host GUI
 gui:
     cargo run -p oxifoc-host-slint
@@ -128,6 +142,8 @@ size:
     measure oxifoc-f405 oxifoc-f405-cf2 memory.x target/cf2
     measure oxifoc-f405 oxifoc-f405-vesc6-mk5 memory.x target/vesc6-mk5 --no-default-features \
         --features board-vesc6-mk5
+    measure oxifoc-f405 oxifoc-f405-jbldc memory.x target/jbldc --no-default-features \
+        --features board-jbldc
 
 # Clean all build artifacts
 clean:

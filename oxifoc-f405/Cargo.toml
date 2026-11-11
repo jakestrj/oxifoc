@@ -21,6 +21,11 @@ board-cf2 = []
 # shutdown latch PC5, current/phase filter enables PD2/PC13.
 # See docs/hw/vesc6-mk5.md.
 board-vesc6-mk5 = []
+# JBLDC high-voltage IGBT inverter: 6x Infineon EiceDRIVER (1ED38x0Mc12M) on
+# I2C1 (PB6/PB7) with per-switch RDYC/FLT_N pins, MLX91208 IMC Hall current
+# sensors (PC2/PC1/PC0), HVDC VBUS sense (PA0, 47:1), IGBT NTC (PB1), 3000 ns
+# dead time, sensorless-only (PC6/PC7 used by WH gate driver).
+board-jbldc = []
 # Observer-internals fast-frame mapping (erpm<-PLL, vd<-frame gap,
 # vq<-readiness err signed by trust; see oxifoc-core `obs-debug-telem`).
 # Debug builds only.

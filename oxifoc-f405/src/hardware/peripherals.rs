@@ -1,12 +1,12 @@
 //! Peripheral initialization for STM32F405
 
 use embassy_stm32::adc::{Adc, AdcChannel, Exten, InjectedAdc, InjectedAdcTrigger, SampleTime};
+use embassy_stm32::{Config as StmConfig, Peripherals, mode::Blocking, time::Hertz};
+#[cfg(not(feature = "board-jbldc"))]
 use embassy_stm32::{
-    Config as StmConfig, Peri, Peripherals,
+    Peri,
     gpio::{Level, Output, Speed},
-    mode::Blocking,
     peripherals,
-    time::Hertz,
 };
 
 /// Initialize system clock for STM32F405 with 8MHz HSE
@@ -57,11 +57,13 @@ pub fn init_clock() -> Peripherals {
 }
 
 /// Initialize green LED on PB0 (heartbeat)
+#[cfg(not(feature = "board-jbldc"))]
 pub fn init_green_led(pb0: Peri<'static, peripherals::PB0>) -> Output<'static> {
     Output::new(pb0, Level::High, Speed::Low)
 }
 
 /// Initialize red LED on PB1 (fault indicator)
+#[cfg(not(feature = "board-jbldc"))]
 pub fn init_red_led(pb1: Peri<'static, peripherals::PB1>) -> Output<'static> {
     Output::new(pb1, Level::High, Speed::Low)
 }
@@ -84,6 +86,7 @@ pub struct AdcHandles {
 ///
 /// All triggered simultaneously by TIM1_CC4 rising edge.
 /// ADC3 generates JEOC interrupt (signals all ADCs done).
+#[cfg(not(feature = "board-jbldc"))]
 #[allow(clippy::too_many_arguments)]
 pub fn init_adc(
     adc1_peri: Peri<'static, peripherals::ADC1>,
@@ -140,6 +143,63 @@ pub fn init_adc(
     // foc::init() enables it after installing ADC handles into statics.
 
     defmt::info!("ADC1/ADC2/ADC3 initialized with TIM1_CC4-triggered injected conversions");
+
+    AdcHandles {
+        adc1: injected_adc1,
+        adc2: injected_adc2,
+        adc3: injected_adc3,
+    }
+}
+
+/// Initialize ADC1/ADC2/ADC3 injected conversions for JBLDC (`hw_jbldc.h`).
+///
+/// Rank 1 across ADC1/ADC2/ADC3 samples all three phase currents simultaneously:
+/// - ADC1 injected: Phase A current (`CURR1` = PC2, ch12) + IGBT NTC (`TEMP_MOS` = PB1, ch9)
+/// - ADC2 injected: Phase B current (`CURR2` = PC1, ch11)
+/// - ADC3 injected: Phase C current (`CURR3` = PC0, ch10) + HVDC VBUS (`VIN_SENSE` = PA0, ch0)
+///
+/// ADC3 (2 ranks, matching ADC1's 2 ranks and outlasting ADC2's 1 rank) raises `JEOC`.
+#[cfg(feature = "board-jbldc")]
+pub fn init_adc(r: super::resources::AdcResources) -> AdcHandles {
+    let adc1 = Adc::new(r.adc1);
+    let adc2 = Adc::new(r.adc2);
+    let adc3 = Adc::new(r.adc3);
+
+    let injected_adc1 = adc1.setup_injected_conversions(
+        (),
+        [
+            (r.pc2.degrade_adc(), SampleTime::Cycles15), // Phase A current (CURR1, PC2, ch12)
+            (r.pb1.degrade_adc(), SampleTime::Cycles15), // IGBT module NTC (PB1, ch9)
+        ],
+        InjectedAdcTrigger::from(embassy_stm32::triggers::TIM1_CH4, Exten::RisingEdge),
+        Blocking,
+    );
+
+    let injected_adc2 = adc2.setup_injected_conversions(
+        (),
+        [
+            (r.pc1.degrade_adc(), SampleTime::Cycles15), // Phase B current (CURR2, PC1, ch11)
+        ],
+        InjectedAdcTrigger::from(embassy_stm32::triggers::TIM1_CH4, Exten::RisingEdge),
+        Blocking,
+    );
+
+    let injected_adc3 = adc3.setup_injected_conversions(
+        (),
+        [
+            (r.pc0.degrade_adc(), SampleTime::Cycles15), // Phase C current (CURR3, PC0, ch10)
+            (r.pa0.degrade_adc(), SampleTime::Cycles15), // HVDC VBUS (VIN_SENSE, PA0, ch0)
+        ],
+        InjectedAdcTrigger::from(embassy_stm32::triggers::TIM1_CH4, Exten::RisingEdge),
+        Blocking,
+    );
+    embassy_stm32::pac::ADC3
+        .cr1()
+        .modify(|w| w.set_jeocie(true));
+
+    defmt::info!(
+        "JBLDC ADC1/ADC2/ADC3 initialized: IA=PC2 IB=PC1 IC=PC0 VBUS=PA0 IGBT_NTC=PB1 (TIM1_CH4)"
+    );
 
     AdcHandles {
         adc1: injected_adc1,

@@ -1,17 +1,30 @@
 #![no_std]
 #![no_main]
 
-#[cfg(not(any(feature = "board-cf2", feature = "board-vesc6-mk5")))]
-compile_error!("select exactly one board feature: board-cf2 or board-vesc6-mk5");
-#[cfg(all(feature = "board-cf2", feature = "board-vesc6-mk5"))]
-compile_error!("board-cf2 and board-vesc6-mk5 are mutually exclusive");
+#[cfg(not(any(
+    feature = "board-cf2",
+    feature = "board-vesc6-mk5",
+    feature = "board-jbldc"
+)))]
+compile_error!("select exactly one board feature: board-cf2, board-vesc6-mk5, or board-jbldc");
+#[cfg(any(
+    all(feature = "board-cf2", feature = "board-vesc6-mk5"),
+    all(feature = "board-cf2", feature = "board-jbldc"),
+    all(feature = "board-vesc6-mk5", feature = "board-jbldc"),
+))]
+compile_error!("board-cf2, board-vesc6-mk5, and board-jbldc are mutually exclusive");
 
 use embassy_executor::Spawner;
+#[cfg(not(feature = "board-jbldc"))]
 use embassy_stm32::gpio::Output;
-use embassy_stm32::{bind_interrupts, exti, interrupt};
+use embassy_stm32::interrupt;
+#[cfg(not(feature = "board-jbldc"))]
+use embassy_stm32::{bind_interrupts, exti};
+#[cfg(not(feature = "board-jbldc"))]
 use embassy_time::{Duration, Timer};
 
-// Bind EXTI9_5 interrupt for nFAULT monitoring (PB7/EXTI7)
+// Bind EXTI9_5 interrupt for DRV8301 nFAULT monitoring (PB7/EXTI7)
+#[cfg(not(feature = "board-jbldc"))]
 bind_interrupts!(struct ExtiIrqs {
     EXTI9_5 => exti::InterruptHandler<interrupt::typelevel::EXTI9_5>;
 });
@@ -30,11 +43,17 @@ mod sensors;
 mod storage;
 mod transport;
 
+#[cfg(feature = "board-jbldc")]
+#[allow(unused_imports)]
+use hardware::AdcResources;
 #[cfg(feature = "board-vesc6-mk5")]
 #[allow(unused_imports)]
 use hardware::BoardCtrlResources;
+#[cfg(not(feature = "board-jbldc"))]
 #[allow(unused_imports)]
-use hardware::{AssignedResources, CanResources, DrvResources, HallResources, MotorResources};
+use hardware::HallResources;
+#[allow(unused_imports)]
+use hardware::{AssignedResources, CanResources, DrvResources, MotorResources};
 use motor::MotorPwm;
 
 // Define platform state with our fault type
@@ -84,13 +103,18 @@ async fn main(spawner: Spawner) {
     rtt_target::rtt_init_defmt!();
 
     // ========== STEP 3: Initialize LEDs ==========
-    let green_led = hardware::peripherals::init_green_led(p.PB0);
-    let red_led = hardware::peripherals::init_red_led(p.PB1);
-    spawner.spawn(defmt::unwrap!(heartbeat(green_led)));
-    spawner.spawn(defmt::unwrap!(fault_led(red_led)));
+    // JBLDC uses PB0 for FLT_N_VL and PB1 for the IGBT NTC (ADC12_IN9).
+    #[cfg(not(feature = "board-jbldc"))]
+    {
+        let green_led = hardware::peripherals::init_green_led(p.PB0);
+        let red_led = hardware::peripherals::init_red_led(p.PB1);
+        spawner.spawn(defmt::unwrap!(heartbeat(green_led)));
+        spawner.spawn(defmt::unwrap!(fault_led(red_led)));
+    }
 
     // ========== STEP 4: Split Hardware Resources ==========
-    let r = split_resources!(p);
+    #[cfg_attr(not(feature = "board-jbldc"), allow(unused_mut))]
+    let mut r = split_resources!(p);
 
     // MK5: latch the power button (PC5) and enable the current/phase-sense
     // filters ASAP — releasing the button before PC5 goes high powers the
@@ -112,38 +136,67 @@ async fn main(spawner: Spawner) {
     critical_section::with(|cs| RUNTIME_CONFIG.borrow(cs).replace(runtime_config.clone()));
     defmt::info!("Config loaded from flash");
 
-    // ========== STEP 9: Initialize DRV8301 Gate Driver ==========
-    let (drv_config, nfault) = hardware::drv8301::init_bus(r.drv, ExtiIrqs);
+    // ========== STEP 9: Initialize Gate Driver ==========
+    #[cfg(not(feature = "board-jbldc"))]
+    {
+        let (drv_config, nfault) = hardware::drv8301::init_bus(r.drv, ExtiIrqs);
 
-    let (drv_spi, drv_result) = hardware::drv8301::configure_drv8301(drv_config);
-    match drv_result {
-        Ok(()) => {
-            defmt::info!("DRV8301 ready");
-            hardware::drv8301::enable_gate_driver();
+        let (drv_spi, drv_result) = hardware::drv8301::configure_drv8301(drv_config);
+        match drv_result {
+            Ok(()) => {
+                defmt::info!("DRV8301 ready");
+                hardware::drv8301::enable_gate_driver();
+            }
+            Err(_e) => {
+                // An unconfigured DRV runs on its power-on defaults: shunt gain
+                // 10 where the board calib assumes 20 (every current reads 2x
+                // low, the software OC trip is effectively doubled) and no
+                // VDS-OCP programmed. On the MK5's bit-bang SPI one flaky wire
+                // lands exactly here. Kill-class fault + gate driver held off:
+                // even after a fault clear the bridge cannot switch.
+                defmt::error!(
+                    "DRV8301 configuration failed: DriverFault raised, gate driver disabled"
+                );
+                hardware::drv8301::disable_gate_driver();
+                FAULT_REGISTRY.set(fault::F405Fault::DrvConfigFailed);
+            }
         }
-        Err(_e) => {
-            // An unconfigured DRV runs on its power-on defaults: shunt gain
-            // 10 where the board calib assumes 20 (every current reads 2x
-            // low, the software OC trip is effectively doubled) and no
-            // VDS-OCP programmed. On the MK5's bit-bang SPI one flaky wire
-            // lands exactly here. Kill-class fault + gate driver held off:
-            // even after a fault clear the bridge cannot switch.
-            defmt::error!("DRV8301 configuration failed: DriverFault raised, gate driver disabled");
-            hardware::drv8301::disable_gate_driver();
-            FAULT_REGISTRY.set(fault::F405Fault::DrvConfigFailed);
-        }
+        spawner.spawn(defmt::unwrap!(hardware::drv8301::nfault_monitor_task(
+            nfault, drv_spi
+        )));
     }
-    spawner.spawn(defmt::unwrap!(hardware::drv8301::nfault_monitor_task(
-        nfault, drv_spi
-    )));
 
-    // ========== STEP 10: Initialize Hall Sensor ==========
+    #[cfg(feature = "board-jbldc")]
+    {
+        let (gd_monitor, gd_res) = hardware::eicedriver::configure_all(&mut r.motor, r.drv).await;
+        let gd_configured = if gd_res.is_ok() {
+            defmt::info!("EiceDRIVER stage ready");
+            true
+        } else {
+            defmt::error!(
+                "EiceDRIVER configuration failed: DriverFault raised, gate stage held disabled"
+            );
+            FAULT_REGISTRY.set(fault::F405Fault::DrvConfigFailed);
+            false
+        };
+        spawner.spawn(defmt::unwrap!(
+            hardware::eicedriver::eicedriver_monitor_task(gd_monitor, gd_configured)
+        ));
+    }
+
+    // ========== STEP 10: Initialize Hall Sensor / Timebase ==========
+    #[cfg(not(feature = "board-jbldc"))]
     sensors::init_hall(r.hall.pc6, r.hall.pc7, r.hall.pc8, p.TIM3);
+    #[cfg(feature = "board-jbldc")]
+    sensors::init_hall(p.TIM3);
 
     // ========== STEP 11: Initialize ADCs ==========
+    #[cfg(not(feature = "board-jbldc"))]
     let adc_handles = hardware::peripherals::init_adc(
         p.ADC1, p.ADC2, p.ADC3, p.PC0, p.PA3, p.PC1, p.PC4, p.PC2, p.PC3,
     );
+    #[cfg(feature = "board-jbldc")]
+    let adc_handles = hardware::peripherals::init_adc(r.adc);
 
     // ========== STEP 12: Initialize Motor PWM ==========
     let motor_pwm = MotorPwm::new(r.motor, config::PWM_CONFIG);
@@ -169,6 +222,12 @@ async fn main(spawner: Spawner) {
          bit-bang SPI CS/SCK/MISO/MOSI=PC9/PC10/PB3/PB4, halls=PC6/7/8, ADC currents PC0-2 \
          (phase shunts), VBUS PC3, CAN1 RX=PB8 TX=PB9, latch PC5, filters PD2/PC13"
     );
+    #[cfg(feature = "board-jbldc")]
+    defmt::info!(
+        "F405 board=JBLDC: PWM PA8/PA9/PA10 + PB13/14/15 (3000ns DT), 6x EiceDRIVER on I2C1 \
+         PB6/PB7 (0x0E..=0x13) + GD temp 0x48, ADC IA/IB/IC=PC2/PC1/PC0, VBUS=PA0 (47:1), \
+         IGBT NTC=PB1, CAN1 RX=PB8 TX=PB9"
+    );
     defmt::info!(
         "Board config: shunt={=f32}Ω, amp_gain={=f32} V/V, vbus_ratio={=f32}:1, faults={}",
         config::BOARD.calib.shunt_ohms,
@@ -181,6 +240,7 @@ async fn main(spawner: Spawner) {
 // ========== Background Tasks ==========
 
 /// Blink green LED so we know the scheduler is alive
+#[cfg(not(feature = "board-jbldc"))]
 #[embassy_executor::task]
 async fn heartbeat(mut led: Output<'static>) {
     loop {
@@ -192,6 +252,7 @@ async fn heartbeat(mut led: Output<'static>) {
 }
 
 /// Red LED fault indicator — on when any fault is active
+#[cfg(not(feature = "board-jbldc"))]
 #[embassy_executor::task]
 async fn fault_led(mut led: Output<'static>) {
     loop {

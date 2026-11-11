@@ -27,6 +27,8 @@ pub fn kill_gates() {
     // MOE=0 puts every TIM1 output into its inactive state immediately.
     pac::TIM1.bdtr().modify(|w| w.set_moe(false));
     // EN_GATE (PB5) low: shut down the DRV8301 gate driver entirely.
+    // JBLDC uses isolated Infineon EiceDRIVERs with no master EN_GATE pin.
+    #[cfg(not(feature = "board-jbldc"))]
     pac::GPIOB.bsrr().write(|w| w.set_br(5, true));
 }
 

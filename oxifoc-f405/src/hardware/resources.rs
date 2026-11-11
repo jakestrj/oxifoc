@@ -78,3 +78,50 @@ assign_resources! {
         pc13: PC13, // PHASE_FILTER enable (active high, MK5+)
     }
 }
+
+#[cfg(feature = "board-jbldc")]
+assign_resources! {
+    motor: MotorResources {
+        tim1: TIM1,
+        pa8: PA8,   // Phase U high (UH IN)
+        pa9: PA9,   // Phase V high (VH IN)
+        pa10: PA10, // Phase W high (WH IN)
+        pb13: PB13, // Phase U low  (UL IN)
+        pb14: PB14, // Phase V low  (VL IN)
+        pb15: PB15, // Phase W low  (WL IN)
+    }
+    drv: DrvResources {
+        i2c1: I2C1,
+        pb6: PB6,   // I2C1_SCL (EiceDRIVERs + 0x48 GD temp sensor)
+        pb7: PB7,   // I2C1_SDA
+        // Per-switch RDYC pins (open-drain ready / chip-select / fault-reset)
+        pb4: PB4,   // RDYC_UH
+        pc10: PC10, // RDYC_UL
+        pc12: PC12, // RDYC_VH
+        pc5: PC5,   // RDYC_VL
+        pc7: PC7,   // RDYC_WH
+        pa3: PA3,   // RDYC_WL
+        // Per-switch FLT_N pins (active-low fault outputs)
+        pc11: PC11, // FLT_N_UH
+        pa15: PA15, // FLT_N_UL
+        pd2: PD2,   // FLT_N_VH
+        pb0: PB0,   // FLT_N_VL
+        pc6: PC6,   // FLT_N_WH
+        pa4: PA4,   // FLT_N_WL
+    }
+    adc: AdcResources {
+        adc1: ADC1,
+        adc2: ADC2,
+        adc3: ADC3,
+        pc2: PC2,   // CURR1: Phase A current (ADC123_IN12)
+        pc1: PC1,   // CURR2: Phase B current (ADC123_IN11)
+        pc0: PC0,   // CURR3: Phase C current (ADC123_IN10)
+        pa0: PA0,   // VIN_SENSE: HVDC bus voltage (ADC123_IN0)
+        pb1: PB1,   // NTC_SENSE: IGBT module temperature (ADC12_IN9)
+    }
+    can: CanResources {
+        can: CAN1,
+        rx: PB8,    // CAN1 RX
+        tx: PB9,    // CAN1 TX
+    }
+}
