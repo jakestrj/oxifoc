@@ -23,6 +23,10 @@ pub enum PhaseSourceKind {
     Hall,
     /// Hall with observer fallback + velocity blend (default sensored mode).
     HallFallback,
+    /// Optical/magnetic encoder only.
+    Encoder,
+    /// Encoder with observer fallback + velocity blend.
+    EncoderFallback,
     /// Back-EMF observer only (needs spin-up).
     Observer,
     /// HFI only (zero/low speed, salient motors).
@@ -35,9 +39,11 @@ pub enum PhaseSourceKind {
 
 impl PhaseSourceKind {
     /// All kinds in selector order; the position is the combo-box index.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Hall,
         Self::HallFallback,
+        Self::Encoder,
+        Self::EncoderFallback,
         Self::Observer,
         Self::Hfi,
         Self::HfiObserver,
@@ -60,6 +66,11 @@ pub fn preset(kind: PhaseSourceKind, switch_vel: f32, toggle_v: f32) -> PhaseSou
     match kind {
         PhaseSourceKind::Hall => PhaseSource::Hall,
         PhaseSourceKind::HallFallback => PhaseSource::HallToObserver {
+            blend_low: switch_vel,
+            blend_high: switch_vel * 2.0,
+        },
+        PhaseSourceKind::Encoder => PhaseSource::Encoder,
+        PhaseSourceKind::EncoderFallback => PhaseSource::EncoderToObserver {
             blend_low: switch_vel,
             blend_high: switch_vel * 2.0,
         },
@@ -93,5 +104,37 @@ pub fn label(src: PhaseSource) -> &'static str {
         P::HfiToEncoder { .. } => "HFI→Enc",
         P::Manual => "Manual",
         P::OpenLoop => "OpenLoop",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_phase_source_kind_round_trip() {
+        for (i, &kind) in PhaseSourceKind::ALL.iter().enumerate() {
+            assert_eq!(PhaseSourceKind::from_index(i as i32), Some(kind));
+        }
+        assert_eq!(
+            PhaseSourceKind::from_index(PhaseSourceKind::ALL.len() as i32),
+            None
+        );
+        assert_eq!(PhaseSourceKind::from_index(-1), None);
+    }
+
+    #[test]
+    fn test_encoder_preset() {
+        assert_eq!(
+            preset(PhaseSourceKind::Encoder, 150.0, 2.0),
+            PhaseSource::Encoder
+        );
+        assert_eq!(
+            preset(PhaseSourceKind::EncoderFallback, 150.0, 2.0),
+            PhaseSource::EncoderToObserver {
+                blend_low: 150.0,
+                blend_high: 300.0,
+            }
+        );
     }
 }
