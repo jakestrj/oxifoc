@@ -36,9 +36,7 @@ fn format_switch_row(sw: &GateDriverSwitchTelemetry, populated: bool) -> GateDri
         "UNCONFIG"
     } else if !sw.i2c_ok {
         "I2C ERR"
-    } else if !sw.flt_n {
-        "FLT_N LOW"
-    } else if sw.fltevt != 0 || sw.gfltevt != 0 || sw.secuvevt != 0 {
+    } else if sw.fltevt != 0 || sw.has_gflt() || sw.secuvevt != 0 || sw.comerrst != 0 {
         "FAULT"
     } else if !sw.is_ready() {
         "NOT RDY"

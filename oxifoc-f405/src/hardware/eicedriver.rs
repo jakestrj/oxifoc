@@ -60,6 +60,9 @@ const CHIPSTAT_CONFIG_BIT: u8 = 1 << 3;
 /// `RDYSTAT` bits `[2:0]`: `CHIP_RDY | PRI_RDY | SEC_RDY` (`STATUS_READY = 0x07`).
 const RDYSTAT_ALL_READY: u8 = 0x07;
 
+/// `GFLTEVT` (`0x29`) active-low fault bits `[1:0]`: `PRI_FLTN | SEC_FLTN` (`0x03` = no fault).
+const GFLTEVT_NO_FAULT: u8 = GateDriverSwitchTelemetry::GFLTEVT_NO_FAULT;
+
 #[derive(Clone, Copy)]
 struct SwitchMeta {
     name: &'static str,
@@ -227,7 +230,7 @@ impl EiceDriverValues {
     fn has_fault_or_unready(&self) -> bool {
         self.rdy_raw != RDYSTAT_ALL_READY
             || self.fltevt != 0
-            || self.gfltevt != 0
+            || (self.gfltevt & GFLTEVT_NO_FAULT) != GFLTEVT_NO_FAULT
             || self.secuvevt != 0
     }
 }
@@ -624,10 +627,13 @@ pub async fn eicedriver_monitor_task(mut monitor: EiceDriverMonitor, gd_configur
             match read_driver_status_bytes(&mut monitor.i2c, sw.dev_addr) {
                 Ok(rx) => {
                     let vals = EiceDriverValues::from_status_bytes(&rx);
-                    if vals.rdy_raw != RDYSTAT_ALL_READY || !flt_n || !rdyc {
+                    // Fault/ready detection uses the digital I2C registers rather than
+                    // raw FLT_N GPIO reads, matching hw_jbldc.c::is_gate_driver_fault()
+                    // where FLT_N GPIO polling is disabled due to board pin noise.
+                    if vals.rdy_raw != RDYSTAT_ALL_READY {
                         unready_mask |= bit;
                     }
-                    if (vals.has_fault_or_unready() || !flt_n || !rdyc) && first_fault.is_none() {
+                    if vals.has_fault_or_unready() && first_fault.is_none() {
                         first_fault = Some((idx as u8, vals));
                     }
                     switch_telemetry[idx] = GateDriverSwitchTelemetry::from_status_bytes(
@@ -658,17 +664,10 @@ pub async fn eicedriver_monitor_task(mut monitor: EiceDriverMonitor, gd_configur
             }
         }
 
-        // Publish the first faulted/unready switch immediately so the host sees
-        // diagnostic registers right away; otherwise advance round-robin across UH..WL.
-        let publish_idx = if let Some((sw_idx, _)) = first_fault {
-            usize::from(sw_idx)
-        } else if let Some(sw_idx) = first_i2c_err_sw {
-            usize::from(sw_idx)
-        } else {
-            let idx = rr_switch_idx;
-            rr_switch_idx = (rr_switch_idx + 1) % GateDriverSwitch::COUNT;
-            idx
-        };
+        // Always advance round-robin across UH..WL so all 6 switches remain populated
+        // in the host UI even if an earlier switch has an active fault.
+        let publish_idx = rr_switch_idx;
+        rr_switch_idx = (rr_switch_idx + 1) % GateDriverSwitch::COUNT;
         publish_gate_driver_telemetry(switch_telemetry[publish_idx]);
 
         if i2c_err_mask != 0 {
@@ -693,7 +692,7 @@ pub async fn eicedriver_monitor_task(mut monitor: EiceDriverMonitor, gd_configur
                     first_switch: first_i2c_err_sw.unwrap_or(0),
                     rdy_stat: 0,
                     fltevt: 0,
-                    gfltevt: 0,
+                    gfltevt: GFLTEVT_NO_FAULT,
                     secuvevt: 0,
                 }
             };

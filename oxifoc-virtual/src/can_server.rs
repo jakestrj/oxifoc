@@ -60,7 +60,7 @@ async fn run_virtual_gate_driver_publisher() {
             pri_rdy: true,
             sec_rdy: true,
             secuvevt: 0,
-            gfltevt: 0,
+            gfltevt: GateDriverSwitchTelemetry::GFLTEVT_NO_FAULT,
             fltevt: 0,
             pinstat: 0x05,
             comerrst: 0,

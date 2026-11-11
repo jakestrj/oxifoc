@@ -23,7 +23,7 @@ pub struct EiceDriverFaultStatus {
     pub rdy_stat: u8,
     /// Raw `FLTEVT` register of `first_switch` (DESAT / OCP / TSD events).
     pub fltevt: u8,
-    /// Raw `GFLTEVT` register of `first_switch` (gate / clamping fault events).
+    /// Raw `GFLTEVT` register (`0x29`) of `first_switch` (`bit0 = PRI_FLTN`, `bit1 = SEC_FLTN`; `0x03` = healthy).
     pub gfltevt: u8,
     /// Raw `SECUVEVT` register of `first_switch` (secondary supply UVLO events).
     pub secuvevt: u8,
@@ -147,7 +147,7 @@ impl PlatformFault for F405Fault {
                     let _ = s.push_str(" flt=");
                     push_hex_u8(&mut s, status.fltevt);
                 }
-                if status.gfltevt != 0 {
+                if (status.gfltevt & 0x03) != 0x03 {
                     let _ = s.push_str(" gflt=");
                     push_hex_u8(&mut s, status.gfltevt);
                 }

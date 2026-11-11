@@ -605,39 +605,39 @@ pub struct GateDriverSwitchTelemetry {
     pub flt_n: bool,
     /// Physical `RDYC` pin state (`true` = high / ready).
     pub rdyc: bool,
-    /// `RDYSTAT[0]` — chip ready.
+    /// `RDYSTAT[0]` (`0x26`) — chip ready.
     pub chip_rdy: bool,
-    /// `RDYSTAT[1]` — primary-side ready.
+    /// `RDYSTAT[1]` (`0x26`) — primary-side ready.
     pub pri_rdy: bool,
-    /// `RDYSTAT[2]` — secondary-side ready.
+    /// `RDYSTAT[2]` (`0x26`) — secondary-side ready.
     pub sec_rdy: bool,
-    /// `SECUVEVT` (`0x1D`) — secondary supply undervoltage event flags.
+    /// `SECUVEVT` (`0x28`) — secondary supply undervoltage event flags (`0x00` = no UV event).
     pub secuvevt: u8,
-    /// `GFLTEVT` (`0x1E`) — gate fault event flags.
+    /// `GFLTEVT` (`0x29`) — global active-low fault indicators (`bit0 = PRI_FLTN`, `bit1 = SEC_FLTN`; `0x03` = healthy).
     pub gfltevt: u8,
-    /// `FLTEVT` (`0x1F`) — primary fault event flags (DESAT, SCP, OTSD, etc.).
+    /// `FLTEVT` (`0x2A`) — fault event flags (DESAT, SCP, OTSD, `VOUT_ST`, etc.; `0x00` = no fault).
     pub fltevt: u8,
-    /// `PINSTAT` (`0x20`) — input/output pin status.
+    /// `PINSTAT` (`0x2B`) — input/output pin status.
     pub pinstat: u8,
-    /// `COMERRST` (`0x21`) — Primary-to-secondary / I2C communication error status.
+    /// `COMERRST` (`0x2C`) — primary-to-secondary / I2C communication error status.
     pub comerrst: u8,
-    /// `CHIPSTAT` (`0x22`) — internal chip state machine status.
+    /// `CHIPSTAT` (`0x2D`) — internal chip state machine status (`bit3 = CONFIG`).
     pub chipstat: u8,
-    /// `EVTSTICK` (`0x23`) — sticky event summary register.
+    /// `EVTSTICK` (`0x2E`) — sticky event summary register.
     pub evtstick: u8,
-    /// `UV1FCNT` (`0x24`) — primary supply undervoltage fault counter.
+    /// `UV1FCNT` (`0x2F`) — primary supply undervoltage fault counter.
     pub uv1fcnt: u8,
-    /// `UV2FCNT` (`0x25`) — secondary supply undervoltage fault counter.
+    /// `UV2FCNT` (`0x30`) — secondary supply undervoltage fault counter.
     pub uv2fcnt: u8,
-    /// `D2ECNT` (`0x26`) — chip-to-chip communication error counter.
+    /// `D2ECNT` (`0x31`) — chip-to-chip communication error counter.
     pub d2ecnt: u8,
-    /// `ADCMVDIF` (`0x27`) — differential voltage in Volts (`raw / 6.6`).
+    /// `ADCMVDIF` (`0x32`) — differential voltage in Volts (`raw / 6.6`).
     pub adcmvdif: f32,
-    /// `ADCMGND2` (`0x28`) — secondary ground shift / negative supply in Volts (`raw / 6.6`).
+    /// `ADCMGND2` (`0x33`) — secondary ground shift / negative supply in Volts (`raw / 6.6`).
     pub adcmgnd2: f32,
-    /// `ADCMVCC2` (`0x29`) — secondary positive supply in Volts (`raw / 6.6`).
+    /// `ADCMVCC2` (`0x34`) — secondary positive supply in Volts (`raw / 6.6`).
     pub adcmvcc2: f32,
-    /// `ADCMTEMP` (`0x2A`) — gate driver die temperature in °C (`raw * 3.22 - 275.0`).
+    /// `ADCMTEMP` (`0x35`) — gate driver die temperature in °C (`raw * 3.22 - 275.0`).
     pub adcmtemp: f32,
     /// Gate driver PCB temperature in 0.1 °C units (`0x48` I2C sensor).
     pub board_temp_c_x10: i16,
@@ -646,7 +646,11 @@ pub struct GateDriverSwitchTelemetry {
 }
 
 impl GateDriverSwitchTelemetry {
-    /// Decode a 16-byte contiguous register read starting at `REG_RDYSTAT` (`0x1B..=0x2A`)
+    /// Healthy / reset value of `GFLTEVT` (`0x29`): both active-low fault bits
+    /// `PRI_FLTN` (bit 0) and `SEC_FLTN` (bit 1) are high (`0b11 = 0x03`).
+    pub const GFLTEVT_NO_FAULT: u8 = 0x03;
+
+    /// Decode a 16-byte contiguous register read starting at `REG_RDYSTAT` (`0x26..=0x35`)
     /// using the scaling formulas from `bldc-custom/eicedriver/eicedriver.c`.
     #[must_use]
     pub fn from_status_bytes(
@@ -667,7 +671,7 @@ impl GateDriverSwitchTelemetry {
             chip_rdy: (rdystat & 0x01) != 0,
             pri_rdy: ((rdystat >> 1) & 0x01) != 0,
             sec_rdy: ((rdystat >> 2) & 0x01) != 0,
-            // rx[1] is 0x1C (unused gap between RDYSTAT and SECUVEVT)
+            // rx[1] is 0x27 (reserved byte between RDYSTAT and SECUVEVT)
             secuvevt: rx[2],
             gfltevt: rx[3],
             fltevt: rx[4],
@@ -687,34 +691,43 @@ impl GateDriverSwitchTelemetry {
         }
     }
 
-    /// True when the switch is configured, I2C is healthy, all three ready bits
-    /// are asserted, and no fault pin or fault event register is active.
+    /// True when `GFLTEVT` (`0x29`) indicates an active primary or secondary fault
+    /// (`PRI_FLTN == 0` or `SEC_FLTN == 0`).
+    #[must_use]
+    pub const fn has_gflt(&self) -> bool {
+        (self.gfltevt & Self::GFLTEVT_NO_FAULT) != Self::GFLTEVT_NO_FAULT
+    }
+
+    /// True when the switch is configured, I2C is healthy, all three `RDYSTAT` ready bits
+    /// are asserted, and no fault event register is active.
     #[must_use]
     pub const fn is_ready(&self) -> bool {
         self.configured
             && self.i2c_ok
-            && self.flt_n
-            && self.rdyc
             && self.chip_rdy
             && self.pri_rdy
             && self.sec_rdy
             && self.fltevt == 0
-            && self.gfltevt == 0
+            && !self.has_gflt()
             && self.secuvevt == 0
     }
 
-    /// True when a hardware fault pin is asserted or any fault/error event register is non-zero.
+    /// True when I2C communication failed, the driver is unready, or any fault/error
+    /// event register is active.
+    ///
+    /// Note: Physical `FLT_N` / `RDYC` GPIO states are reported in telemetry for
+    /// diagnostics, but fault status is determined from the digital I2C registers
+    /// because the physical `FLT_N` lines are subject to switching noise on JBLDC
+    /// (`hw_jbldc.c::is_gate_driver_fault`).
     #[must_use]
     pub const fn has_fault(&self) -> bool {
         !self.configured
             || !self.i2c_ok
-            || !self.flt_n
-            || !self.rdyc
             || !self.chip_rdy
             || !self.pri_rdy
             || !self.sec_rdy
             || self.fltevt != 0
-            || self.gfltevt != 0
+            || self.has_gflt()
             || self.secuvevt != 0
             || self.comerrst != 0
     }
@@ -1475,5 +1488,61 @@ mod tests {
         let decoded: FastTelemetryBatch = postcard::from_bytes(wire).unwrap();
         let out: Vec<FastTelemetry, FAST_BATCH_SAMPLES> = decoded.samples().collect();
         assert_eq!(out, samples);
+    }
+
+    #[test]
+    fn eicedriver_gfltevt_0x03_is_healthy_and_0_bits_fault() {
+        // Healthy 1ED38x0Mc12M status burst: RDYSTAT=0x07, SECUVEVT=0x00,
+        // GFLTEVT=0x03 (PRI_FLTN=1, SEC_FLTN=1), FLTEVT=0x00, PINSTAT=0x30,
+        // COMERRST=0x00, CHIPSTAT=0x08.
+        let mut rx = [0u8; 16];
+        rx[0] = 0x07; // RDYSTAT
+        rx[2] = 0x00; // SECUVEVT
+        rx[3] = GateDriverSwitchTelemetry::GFLTEVT_NO_FAULT; // GFLTEVT = 0x03
+        rx[4] = 0x00; // FLTEVT
+        rx[5] = 0x30; // PINSTAT
+        rx[6] = 0x00; // COMERRST
+        rx[7] = 0x08; // CHIPSTAT
+
+        let healthy = GateDriverSwitchTelemetry::from_status_bytes(
+            GateDriverSwitch::Uh,
+            &rx,
+            true,
+            true,
+            240,
+            1,
+        );
+        assert!(!healthy.has_gflt());
+        assert!(healthy.is_ready());
+        assert!(!healthy.has_fault());
+
+        // Pin noise on FLT_N should not mark a switch faulted when I2C registers are clean
+        let noisy_flt_pin = GateDriverSwitchTelemetry::from_status_bytes(
+            GateDriverSwitch::Uh,
+            &rx,
+            false,
+            true,
+            240,
+            2,
+        );
+        assert!(noisy_flt_pin.is_ready());
+        assert!(!noisy_flt_pin.has_fault());
+
+        // SEC_FLTN pulled low (0x01) or PRI_FLTN pulled low (0x02) or both low (0x00) -> fault
+        for fault_gflt in [0x00u8, 0x01, 0x02] {
+            let mut rx_fault = rx;
+            rx_fault[3] = fault_gflt;
+            let sw = GateDriverSwitchTelemetry::from_status_bytes(
+                GateDriverSwitch::Uh,
+                &rx_fault,
+                true,
+                true,
+                240,
+                3,
+            );
+            assert!(sw.has_gflt());
+            assert!(!sw.is_ready());
+            assert!(sw.has_fault());
+        }
     }
 }
