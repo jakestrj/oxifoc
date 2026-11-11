@@ -125,8 +125,6 @@ All platforms: 20 kHz center-aligned PWM, TIM1-triggered injected ADC, Hall poll
 
 **GUI** (`oxifoc-host-slint`) — Slint desktop app with GPU-accelerated real-time charts (WGPU). The Monitor offers Focus, Compare, Overview, and 2 × 2 layouts without scrolling the chart workspace. Focus and Compare let you choose chart groups; the current chart can overlay any combination of Ia, Ib, Ic, Id, and Iq on a shared ampere axis. Click Focus or double-click a chart to enlarge it, then use Back or Esc to restore the previous layout. Use Pause/Resume on each chart, scroll/pinch or the on-plot buttons to zoom, drag to pan while paused, and hover for cursor measurements. Motor control, detection wizard, config read/write.
 
-**CLI** (`oxifoc-host-cli`) — Command-line monitor, motor control, detection.
-
 **Virtual device** (`oxifoc-virtual`) — Simulated motor controller over TCP/UDP. Host tools connect exactly as to real hardware.
 
 Transports: Serial (UART VCP), RTT (probe-rs), TCP (virtual), UDP (virtual), USB (nusb).
@@ -155,7 +153,6 @@ just flash-f405-cf2       # Build and flash Cheap FOCer 2 via probe-rs
 just build-f405-vesc6-mk5 # Build Mini V6 MK5 firmware
 just flash-f405-vesc6-mk5 # Build and flash Mini V6 MK5 via probe-rs
 just gui                  # Run Slint GUI
-just cli -- list          # Run CLI
 ```
 
 The two F405 variants use separate artifact directories:

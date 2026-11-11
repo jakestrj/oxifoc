@@ -1348,7 +1348,7 @@ oxifoc-f405/src/             # STM32F405 platform
 
 Other crates in the repo:
 `oxifoc-virtual` (host-side virtual motor controller), `oxifoc-host-lib` /
-`oxifoc-host-cli` / `oxifoc-host-slint` (host tooling), `oxifoc-bridge` /
+`oxifoc-host-slint` (host tooling), `oxifoc-bridge` /
 `oxifoc-remote` (ESP32-C6 wireless link).
 
 ---

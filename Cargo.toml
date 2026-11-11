@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "oxifoc-core",
     "oxifoc-host-lib",
-    "oxifoc-host-cli",
     "slint-wgpu-plot",
     "oxifoc-host-slint",
     "oxifoc-virtual",

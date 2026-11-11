@@ -98,10 +98,6 @@ flash-f405-vesc6-mk5:
     cd oxifoc-f405 && cargo run --release --target-dir target/vesc6-mk5 --no-default-features \
         --features board-vesc6-mk5
 
-# Run host CLI with arguments
-cli *ARGS:
-    cargo run -p oxifoc-host-cli -- {{ ARGS }}
-
 # Run host GUI
 gui:
     cargo run -p oxifoc-host-slint
