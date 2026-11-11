@@ -22,7 +22,7 @@ use embassy_time::{Duration, Timer};
 use oxifoc_core::foc::controller::FocController;
 use oxifoc_core::foc::current_offset::CurrentOffsetRequest;
 use oxifoc_core::foc::phase::{PhaseManager, PhaseSource};
-use oxifoc_core::foc::sensors::{AdcSnapshot, NoSensor, TempSensorId};
+use oxifoc_core::foc::sensors::{AdcSnapshot, TempSensorId};
 use oxifoc_core::foc::trig::FastSinCos;
 use oxifoc_core::foc::velocity::VelocityLoopConfig;
 use oxifoc_core::motor::FocDriver;
@@ -37,7 +37,7 @@ use oxifoc_core::storage::RuntimeConfig;
 
 use crate::hardware::peripherals::AdcHandles;
 use crate::safety::feed_watchdog;
-use crate::sensors::hall;
+use crate::sensors::{as5147, hall};
 
 #[cfg(feature = "board-jbldc")]
 use crate::config::jbldc_igbt_temp_c_x10_from_adc;
@@ -47,7 +47,9 @@ use crate::config::{NTC_BOARD, NTC_MOTOR};
 #[cfg(feature = "board-jbldc")]
 use crate::hardware::eicedriver::GD_BOARD_TEMP_C_X10;
 use crate::motor::MotorPwm;
-use crate::sensors::{F405CurrentSensor, F405CurrentSensorExt, hall::HallAngleProxy};
+use crate::sensors::{
+    As5147AngleProxy, F405CurrentSensor, F405CurrentSensorExt, hall::HallAngleProxy,
+};
 use crate::{FAULT_REGISTRY, STATE};
 
 // ========== ADC Sample Storage (Global Atomics) ==========
@@ -136,7 +138,7 @@ pub static ADC3_INJECTED: CriticalSectionMutex<
 // ========== FOC Control ==========
 
 /// FOC driver storage (mutated only inside the ADC ISR)
-type PhaseManagerType = PhaseManager<HallAngleProxy, NoSensor, FastSinCos>;
+type PhaseManagerType = PhaseManager<HallAngleProxy, As5147AngleProxy, FastSinCos>;
 type FocDriverType = FocDriver<MotorPwm<'static>, F405CurrentSensor, PhaseManagerType, FastSinCos>;
 static FOC_DRIVER: CriticalSectionMutex<RefCell<Option<FocDriverType>>> =
     CriticalSectionMutex::new(RefCell::new(None));
@@ -156,10 +158,9 @@ pub async fn init(
     ADC1_INJECTED.lock(|cell| cell.replace(Some(adc_handles.adc1)));
     ADC2_INJECTED.lock(|cell| cell.replace(Some(adc_handles.adc2)));
     ADC3_INJECTED.lock(|cell| cell.replace(Some(adc_handles.adc3)));
-    MOTOR_POLE_PAIRS.store(
-        config.motor_params.as_ref().map_or(0, |m| m.pole_pairs),
-        Ordering::Relaxed,
-    );
+    let pole_pairs = config.motor_params.as_ref().map_or(0, |m| m.pole_pairs);
+    MOTOR_POLE_PAIRS.store(pole_pairs, Ordering::Relaxed);
+    as5147::set_pole_pairs(pole_pairs);
 
     // Enable the ADC interrupt and its internal PWM trigger. Phase channels
     // stay high-Z until the calibration state machine selects one.
@@ -202,8 +203,11 @@ pub async fn init(
     #[cfg(not(feature = "board-jbldc"))]
     hall::apply_stored_config(config);
     let hall_proxy = HallAngleProxy::new();
+    let encoder_proxy = As5147AngleProxy::new();
     let initial_vbus_v = first_vbus_v().await;
-    let mut phase_manager = PhaseManager::with_hall(hall_proxy).with_sincos::<FastSinCos>();
+    let mut phase_manager = PhaseManager::with_hall(hall_proxy)
+        .with_encoder(encoder_proxy)
+        .with_sincos::<FastSinCos>();
     // Arm the sensorless estimators (back-EMF + HFI) from detected motor
     // params; the angle source stays Hall until the host switches it.
     phase_manager.configure_observers_from_config(config, initial_vbus_v);
@@ -586,6 +590,21 @@ pub async fn isr_stats_task() {
             hall::OVERCAPTURES.swap(0, Ordering::Relaxed),
             MOTOR_TEMP_RAW.load(Ordering::Relaxed),
         );
+        #[cfg(feature = "board-jbldc")]
+        {
+            let enc = as5147::get_state();
+            defmt::info!(
+                "as5147/s: conn={} raw={} deg={=f32} mag={} agc={} ok={} err={} spi_err_cnt={}",
+                enc.sensor_diag.is_connected,
+                enc.spi_val,
+                enc.last_enc_angle_deg,
+                enc.sensor_diag.magnitude,
+                enc.sensor_diag.agc_value,
+                as5147::SAMPLES_OK.swap(0, Ordering::Relaxed),
+                as5147::SAMPLES_ERR.swap(0, Ordering::Relaxed),
+                enc.spi_error_cnt,
+            );
+        }
         // run_foc_cycle internals (core isr_prof buckets) — same lines as
         // the g431 protocol stats task.
         {

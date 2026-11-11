@@ -124,4 +124,11 @@ assign_resources! {
         rx: PB8,    // CAN1 RX
         tx: PB9,    // CAN1 TX
     }
+    encoder: EncoderResources {
+        spi1: SPI1,
+        pa5: PA5,   // SPI1_SCK  (AS5147 CLK)
+        pa6: PA6,   // SPI1_MISO (AS5147 MISO)
+        pa7: PA7,   // SPI1_MOSI (AS5147 MOSI)
+        pc8: PC8,   // AS5147 CS (active-low NSS)
+    }
 }

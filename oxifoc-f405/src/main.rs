@@ -43,15 +43,15 @@ mod sensors;
 mod storage;
 mod transport;
 
-#[cfg(feature = "board-jbldc")]
-#[allow(unused_imports)]
-use hardware::AdcResources;
 #[cfg(feature = "board-vesc6-mk5")]
 #[allow(unused_imports)]
 use hardware::BoardCtrlResources;
 #[cfg(not(feature = "board-jbldc"))]
 #[allow(unused_imports)]
 use hardware::HallResources;
+#[cfg(feature = "board-jbldc")]
+#[allow(unused_imports)]
+use hardware::{AdcResources, EncoderResources};
 #[allow(unused_imports)]
 use hardware::{AssignedResources, CanResources, DrvResources, MotorResources};
 use motor::MotorPwm;
@@ -184,11 +184,15 @@ async fn main(spawner: Spawner) {
         ));
     }
 
-    // ========== STEP 10: Initialize Hall Sensor / Timebase ==========
+    // ========== STEP 10: Initialize Hall Sensor / Timebase & Encoder ==========
     #[cfg(not(feature = "board-jbldc"))]
     sensors::init_hall(r.hall.pc6, r.hall.pc7, r.hall.pc8, p.TIM3);
     #[cfg(feature = "board-jbldc")]
-    sensors::init_hall(p.TIM3);
+    {
+        sensors::init_hall(p.TIM3);
+        let as5147 = sensors::init_as5147(r.encoder);
+        spawner.spawn(defmt::unwrap!(sensors::as5147_task(as5147)));
+    }
 
     // ========== STEP 11: Initialize ADCs ==========
     #[cfg(not(feature = "board-jbldc"))]
@@ -225,8 +229,8 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "board-jbldc")]
     defmt::info!(
         "F405 board=JBLDC: PWM PA8/PA9/PA10 + PB13/14/15 (3000ns DT), 6x EiceDRIVER on I2C1 \
-         PB6/PB7 (0x0E..=0x13) + GD temp 0x48, ADC IA/IB/IC=PC2/PC1/PC0, VBUS=PA0 (47:1), \
-         IGBT NTC=PB1, CAN1 RX=PB8 TX=PB9"
+         PB6/PB7 (0x0E..=0x13) + GD temp 0x48, AS5147 on SPI1 PA5/PA6/PA7 CS=PC8, \
+         ADC IA/IB/IC=PC2/PC1/PC0, VBUS=PA0 (47:1), IGBT NTC=PB1, CAN1 RX=PB8 TX=PB9"
     );
     defmt::info!(
         "Board config: shunt={=f32}Ω, amp_gain={=f32} V/V, vbus_ratio={=f32}:1, faults={}",
