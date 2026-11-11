@@ -123,8 +123,8 @@ async fn main(spawner: Spawner) {
     let _board_ctrl = hardware::board_early_init(r.board_ctrl);
 
     // ========== STEP 5: Initialize CAN1 Transport & Protocol Tasks ==========
-    let (can_tx, can_rx) = transport::init_can(r.can).await;
-    spawner.spawn(defmt::unwrap!(protocol::servers::can_comm(can_rx, can_tx)));
+    let can = transport::init_can(r.can).await;
+    spawner.spawn(defmt::unwrap!(protocol::servers::can_comm(can)));
     spawner.spawn(defmt::unwrap!(protocol::servers::telemetry_task()));
     spawner.spawn(defmt::unwrap!(protocol::servers::liveness_task()));
 

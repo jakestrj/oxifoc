@@ -28,11 +28,13 @@ bind_interrupts!(pub struct CanIrqs {
 
 struct CanTxSender<'a> {
     can_tx: CanTx<'a>,
+    seq_counter: u8,
 }
 
 impl MessageSender for CanTxSender<'_> {
     async fn send_message_internal(&mut self, encoded_buf: &mut [u8]) -> Result<(), CommsError> {
-        let mut msg = NmeaMessage::from_payload(encoded_buf, 0);
+        let mut msg = NmeaMessage::from_payload(encoded_buf, self.seq_counter);
+        self.seq_counter = (self.seq_counter + 1) & 0x07;
         while let Some(f) = msg.pop_frame() {
             let Ok(frame) = Frame::new_standard(NMEA_TX_ARBITRATION_ID, &f.bytes) else {
                 return Err(CommsError::CanError);
@@ -95,6 +97,9 @@ pub async fn can_task_read(mut can_rx: CanRx<'static>) {
 /// Watch telemetry channels and transmit `streaming-protocol` + `nmea` frames
 /// on `NMEA_TX_ARBITRATION_ID` (`0x7ED`).
 pub async fn can_task_send(can_tx: CanTx<'static>) {
-    let mut sender = CanTxSender { can_tx };
+    let mut sender = CanTxSender {
+        can_tx,
+        seq_counter: 0,
+    };
     send_messages(&mut sender).await;
 }

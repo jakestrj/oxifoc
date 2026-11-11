@@ -42,7 +42,7 @@ check-device:
         (cd "$crate" && cargo fmt --check) || exit 1
         (cd "$crate" && cargo clippy --quiet -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
         if [ "$crate" = "oxifoc-f405" ]; then
-            (cd "$crate" && cargo build --release --quiet --target-dir target/cf2 2>&1 | filter) || exit 1
+            (cd "$crate" && cargo build --release --quiet --target-dir target/jbldc 2>&1 | filter) || exit 1
         else
             (cd "$crate" && cargo build --release --quiet 2>&1 | filter) || exit 1
         fi
@@ -54,12 +54,12 @@ check-device:
     done
     # Non-default F405 boards must not rot. Keep board artifacts in separate
     # directories so no ELF path silently changes electrical meaning.
+    echo "oxifoc-f405 (cf2): clippy + build..."
+    (cd oxifoc-f405 && cargo clippy --quiet --target-dir target/cf2 --no-default-features --features board-cf2 -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
+    (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/cf2 --no-default-features --features board-cf2 2>&1 | filter) || exit 1
     echo "oxifoc-f405 (vesc6-mk5): clippy + build..."
     (cd oxifoc-f405 && cargo clippy --quiet --target-dir target/vesc6-mk5 --no-default-features --features board-vesc6-mk5 -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
     (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/vesc6-mk5 --no-default-features --features board-vesc6-mk5 2>&1 | filter) || exit 1
-    echo "oxifoc-f405 (jbldc): clippy + build..."
-    (cd oxifoc-f405 && cargo clippy --quiet --target-dir target/jbldc --no-default-features --features board-jbldc -- -D warnings -W clippy::disallowed-methods 2>&1 | filter) || exit 1
-    (cd oxifoc-f405 && cargo build --release --quiet --target-dir target/jbldc --no-default-features --features board-jbldc 2>&1 | filter) || exit 1
 
 # Format all code (workspace + device crates)
 fmt:
@@ -88,11 +88,13 @@ flash-g474:
 
 # Build Cheap FOCer 2 firmware (explicit board selection; no F405 default).
 build-f405-cf2:
-    cd oxifoc-f405 && cargo build --release --target-dir target/cf2
+    cd oxifoc-f405 && cargo build --release --target-dir target/cf2 --no-default-features \
+        --features board-cf2
 
 # Build and flash Cheap FOCer 2 firmware.
 flash-f405-cf2:
-    cd oxifoc-f405 && cargo run --release --target-dir target/cf2
+    cd oxifoc-f405 && cargo run --release --target-dir target/cf2 --no-default-features \
+        --features board-cf2
 
 # Build Flipsky Mini V6 MK5 firmware.
 build-f405-vesc6-mk5:
@@ -145,7 +147,8 @@ size:
             "$label" "$used" "$limit" "$((used * 100 / limit))" "$((limit - used))"
     }
     measure oxifoc-g474 oxifoc-g474 memory.x target
-    measure oxifoc-f405 oxifoc-f405-cf2 memory.x target/cf2
+    measure oxifoc-f405 oxifoc-f405-cf2 memory.x target/cf2 --no-default-features \
+        --features board-cf2
     measure oxifoc-f405 oxifoc-f405-vesc6-mk5 memory.x target/vesc6-mk5 --no-default-features \
         --features board-vesc6-mk5
     measure oxifoc-f405 oxifoc-f405-jbldc memory.x target/jbldc --no-default-features \

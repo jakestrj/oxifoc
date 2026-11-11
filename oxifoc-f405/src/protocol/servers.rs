@@ -3,7 +3,7 @@
 use core::sync::atomic::Ordering;
 
 use embassy_futures::join::join;
-use embassy_stm32::can::{CanRx, CanTx};
+use embassy_stm32::can::Can;
 use embassy_time::{Duration, Instant, Ticker};
 
 use oxifoc_core::icd::LIVENESS_TIMEOUT_MS;
@@ -17,8 +17,12 @@ use crate::transport::{can_task_read, can_task_send};
 use crate::{FAULT_REGISTRY, STATE};
 
 /// CAN RX + TX task, modeled after `hv-bms-firmware-rs/src/tasks.rs`.
+///
+/// Owns `can: Can<'static>` for the lifetime of the task so `Drop for Can`
+/// never runs after splitting into `(CanTx, CanRx)`.
 #[embassy_executor::task]
-pub async fn can_comm(can_rx: CanRx<'static>, can_tx: CanTx<'static>) {
+pub async fn can_comm(mut can: Can<'static>) {
+    let (can_tx, can_rx) = can.split();
     join(can_task_read(can_rx), can_task_send(can_tx)).await;
 }
 

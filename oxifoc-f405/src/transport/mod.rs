@@ -30,6 +30,7 @@ bind_interrupts!(pub struct CanIrqs {
 
 struct CanTxSender<'a> {
     can_tx: CanTx<'a>,
+    seq_counter: u8,
 }
 
 impl MessageSender for CanTxSender<'_> {
@@ -37,7 +38,8 @@ impl MessageSender for CanTxSender<'_> {
         let Some(std_id) = StandardId::new(NMEA_TX_ARBITRATION_ID) else {
             return Err(CommsError::CanError);
         };
-        let mut msg = NmeaMessage::from_payload(encoded_buf, 0);
+        let mut msg = NmeaMessage::from_payload(encoded_buf, self.seq_counter);
+        self.seq_counter = (self.seq_counter + 1) & 0x07;
         while let Some(f) = msg.pop_frame() {
             let Ok(frame) = Frame::new_data(std_id, &f.bytes) else {
                 return Err(CommsError::CanError);
@@ -49,15 +51,19 @@ impl MessageSender for CanTxSender<'_> {
     }
 }
 
-/// Initialize CAN1 on PB8 (RX) / PB9 (TX) at 500 kbps with accept-all filter
-/// and return the split `(CanTx, CanRx)` handles.
-pub async fn init_can(res: CanResources) -> (CanTx<'static>, CanRx<'static>) {
+/// Initialize CAN1 on PB8 (RX) / PB9 (TX) at 500 kbps with accept-all filter.
+///
+/// Returns the owned [`Can`] instance so it can be moved into the `can_comm`
+/// task before calling [`Can::split`]. Splitting inside `init_can` would drop
+/// `Can` on return, triggering `Drop for Can` which master-resets `CAN1` into
+/// Sleep Mode (`MCR.RESET = 1`).
+pub async fn init_can(res: CanResources) -> Can<'static> {
     let mut can = Can::new(res.can, res.rx, res.tx, CanIrqs);
     can.modify_filters()
         .enable_bank(0, Fifo::Fifo0, Mask32::accept_all());
     can.set_bitrate(CAN_BITRATE);
     can.enable().await;
-    can.split()
+    can
 }
 
 /// Read incoming 8-byte CAN frames on `NMEA_RX_ARBITRATION_ID` (`0x7E5`),
@@ -95,6 +101,9 @@ pub async fn can_task_read(mut can_rx: CanRx<'static>) {
 /// Watch telemetry channels and transmit `streaming-protocol` + `nmea` frames
 /// on `NMEA_TX_ARBITRATION_ID` (`0x7ED`).
 pub async fn can_task_send(can_tx: CanTx<'static>) {
-    let mut sender = CanTxSender { can_tx };
+    let mut sender = CanTxSender {
+        can_tx,
+        seq_counter: 0,
+    };
     send_messages(&mut sender).await;
 }

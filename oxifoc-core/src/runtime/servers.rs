@@ -13,7 +13,7 @@
 //!   `CMD_CHANNEL`, `FAULT_REGISTRY`, and `FAST_TELEM_PERIOD`.
 
 use core::cell::RefCell;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use critical_section::Mutex as CriticalSectionMutex;
 use embassy_futures::join::join3;
@@ -73,6 +73,10 @@ pub trait MessageSender {
     async fn send_message_internal(&mut self, encoded_buf: &mut [u8]) -> Result<(), CommsError>;
 }
 
+/// Rolling 3-bit NMEA fast-packet sequence counter (`0..=7`) for outgoing
+/// frames encoded via [`encode_wire_message_frames`].
+static NMEA_TX_SEQ: AtomicU8 = AtomicU8::new(0);
+
 /// Encode a [`WireMessage`] with `streaming-protocol` and fragment it into an
 /// [`NmeaMessage`] (sequence of 8-byte CAN frames).
 pub fn encode_wire_message_frames(msg: &WireMessage<'_>) -> Result<NmeaMessage, CommsError> {
@@ -85,7 +89,8 @@ pub fn encode_wire_message_frames(msg: &WireMessage<'_>) -> Result<NmeaMessage, 
     let Some(slice) = encoded_buf.get(..wire_len) else {
         return Err(CommsError::StreamingProtocolEncodeError);
     };
-    Ok(NmeaMessage::from_payload(slice, 0))
+    let seq = NMEA_TX_SEQ.fetch_add(1, Ordering::Relaxed) & 0x07;
+    Ok(NmeaMessage::from_payload(slice, seq))
 }
 
 /// Continuously watch `SLOW_TELEMETRY_WATCH`, `FAST_TELEMETRY_WATCH`,
@@ -239,6 +244,19 @@ impl NmeaCanReceiver {
             self.reset();
             return Err(CommsError::NmeaError);
         };
+        let is_first_frame = (frame_arr[0] & 0x1F) == 0;
+        if is_first_frame {
+            // Clear any incomplete previous multi-frame packet before starting
+            // a new message (nmea::Message::add_frame does not clear its queue
+            // on a new first frame).
+            self.reset();
+        } else if self.message.num_frames == 0 {
+            // Reject mid-stream consecutive frames when no first frame has
+            // been received yet (prevents 0u8 - 1 underflow in
+            // nmea::Message::add_frame and orphan frame accumulation).
+            self.reset();
+            return Err(CommsError::NmeaError);
+        }
         let Ok(finished) = self.message.add_frame(frame_arr) else {
             self.reset();
             return Err(CommsError::NmeaError);
@@ -533,5 +551,63 @@ mod tests {
         assert!(handled_cmd);
         let active = critical_section::with(|cs| state.borrow(cs).borrow().link_active);
         assert!(active);
+    }
+
+    #[test]
+    fn push_frame_handles_mid_stream_consecutive_frame_and_interrupted_packet() {
+        let fast = FastTelemetry {
+            ia: 2048,
+            ib: 2050,
+            ic: 2046,
+            vbus: 24_000,
+            angle: 16384,
+            vd: -120,
+            vq: 1400,
+            rpm: 1500,
+            seq: 42,
+        };
+        let fast_wire = WireMessage {
+            payload: Some(Payload::FastTelemetry(fast.into())),
+            unknown_fields: UnknownFields::empty(),
+        };
+
+        // 1. Mid-stream consecutive frame (frame_counter = 1, sequence_counter = 0)
+        // on a fresh receiver must return Err(CommsError::NmeaError) instead of
+        // panicking with 0u8 - 1 underflow in nmea::Message::add_frame.
+        let mut rx = NmeaCanReceiver::new();
+        let orphan_frame_1 = [0x01u8, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11];
+        assert_eq!(rx.push_frame(&orphan_frame_1), Err(CommsError::NmeaError));
+
+        // 2. Partial multi-frame message (frame 0 and frame 1 only) followed by
+        // a brand-new message must discard the incomplete frames and cleanly
+        // reassemble the new message.
+        let mut partial_tx = encode_wire_message_frames(&fast_wire).unwrap();
+        let partial_f0 = partial_tx.pop_frame().unwrap();
+        let partial_f1 = partial_tx.pop_frame().unwrap();
+        assert_eq!(rx.push_frame(&partial_f0.bytes), Ok(None));
+        assert_eq!(rx.push_frame(&partial_f1.bytes), Ok(None));
+
+        let mut full_tx = encode_wire_message_frames(&fast_wire).unwrap();
+        let mut decoded_fast = None;
+        while let Some(frame) = full_tx.pop_frame() {
+            if let Some(res) = rx
+                .push_frame_with(&frame.bytes, |proto| match proto.payload.as_ref() {
+                    Some(Payload::FastTelemetry(m)) => Ok(FastTelemetry::from(m)),
+                    _ => Err(CommsError::InvalidRequest),
+                })
+                .unwrap()
+            {
+                decoded_fast = Some(res);
+            }
+        }
+        assert_eq!(decoded_fast.unwrap(), fast);
+
+        // 3. Consecutive encode_wire_message_frames calls increment the 3-bit
+        // NMEA sequence counter.
+        let mut tx1 = encode_wire_message_frames(&fast_wire).unwrap();
+        let mut tx2 = encode_wire_message_frames(&fast_wire).unwrap();
+        let seq1 = tx1.pop_frame().unwrap().sequence_counter();
+        let seq2 = tx2.pop_frame().unwrap().sequence_counter();
+        assert_eq!((seq1 + 1) & 0x07, seq2);
     }
 }

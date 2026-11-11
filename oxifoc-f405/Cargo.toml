@@ -11,7 +11,7 @@ test = false
 bench = false
 
 [features]
-default = ["board-cf2"]
+default = ["board-jbldc"]
 # Exactly one board feature must be enabled (compile_error in main.rs).
 # Cheap FOCer 2 / Simple FOCer 2: DRV8301 on hardware SPI3, low-side shunts,
 # amp gain 10 V/V.
