@@ -29,9 +29,10 @@ use oxifoc_core::storage::{
 use oxifoc_core::types::{
     BoardCalib, ConfigApply, ConfigGroupId, ConfigPersist, ConfigResponse, ConfigSnapshot,
     ConfigValue, ConfigWrite, ControlMode, DetectError, DetectRequest, DetectResponse,
-    FastTelemetry, FaultClearTarget, FaultRequest, FaultResponse, FaultSnapshot, HardwareInfo,
-    ICD_BOOTSTRAP_MAGIC, ICD_PROTO_VERSION, Keyed, MotorCommand, MotorCommandOutcome, MotorRequest,
-    MotorState, MotorStatus, SlowTelemetry, TelemetryConfigAck,
+    FastTelemetry, FaultClearTarget, FaultRequest, FaultResponse, FaultSnapshot,
+    GateDriverSnapshot, GateDriverSwitchTelemetry, HardwareInfo, ICD_BOOTSTRAP_MAGIC,
+    ICD_PROTO_VERSION, Keyed, MotorCommand, MotorCommandOutcome, MotorRequest, MotorState,
+    MotorStatus, SlowTelemetry, TelemetryConfigAck,
 };
 use std::{
     sync::{
@@ -218,6 +219,7 @@ pub struct HostRuntime {
     pub fast_rx: Receiver<FastTelemetry>,
     pub slow_rx: Receiver<SlowTelemetry>,
     pub fault_rx: Receiver<FaultSnapshot>,
+    pub gd_rx: Receiver<GateDriverSnapshot>,
     pub device_info_rx: Receiver<HardwareInfo>,
     pub wire_rx: Receiver<LoggedWireMessage>,
     pub cmd_tx: tokio::sync::mpsc::UnboundedSender<HostCommand>,
@@ -320,6 +322,7 @@ struct BackendCtx {
     fast_tx: Sender<FastTelemetry>,
     slow_tx: Sender<SlowTelemetry>,
     fault_sink: FaultSnapshotSink,
+    gd_tx: Sender<GateDriverSnapshot>,
     info_tx: Sender<HardwareInfo>,
     wire_tx: Sender<LoggedWireMessage>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HostCommand>,
@@ -378,6 +381,7 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
     let (fast_tx, fast_rx) = crossbeam_channel::bounded::<FastTelemetry>(4096);
     let (slow_tx, slow_rx) = crossbeam_channel::bounded::<SlowTelemetry>(64);
     let (fault_tx, fault_rx) = crossbeam_channel::bounded::<FaultSnapshot>(64);
+    let (gd_tx, gd_rx) = crossbeam_channel::bounded::<GateDriverSnapshot>(64);
     let (info_tx, device_info_rx) = crossbeam_channel::bounded::<HardwareInfo>(4);
     let (wire_tx, wire_rx) = crossbeam_channel::bounded::<LoggedWireMessage>(4096);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HostCommand>();
@@ -390,6 +394,7 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
         fast_tx,
         slow_tx,
         fault_sink: FaultSnapshotSink::new(fault_tx),
+        gd_tx,
         info_tx,
         wire_tx,
         cmd_rx,
@@ -411,6 +416,7 @@ pub fn start_host(cfg: HostConfig) -> HostRuntime {
         fast_rx,
         slow_rx,
         fault_rx,
+        gd_rx,
         device_info_rx,
         wire_rx,
         cmd_tx,
@@ -654,6 +660,7 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
         let mut active_setpoint: Option<ControlMode> = None;
         let mut last_slow: Option<SlowTelemetry> = None;
         let mut latest_fault_snap = FaultSnapshot::default();
+        let mut latest_gd_snap = GateDriverSnapshot::default();
         let mut last_rx_at = Instant::now();
         let mut affirm_ticker = tokio::time::interval(AFFIRM_INTERVAL);
         affirm_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -695,6 +702,11 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
                                     Some(Payload::FaultState(flt)) => {
                                         Ok(DecodedCanMessage::Fault(FaultStateSnapshot::from(flt)))
                                     }
+                                    Some(Payload::GateDriverTelemetry(gd)) => Ok(
+                                        DecodedCanMessage::GateDriver(
+                                            GateDriverSwitchTelemetry::from(gd),
+                                        ),
+                                    ),
                                     _ => Err(CommsError::InvalidRequest),
                                 }
                             });
@@ -710,6 +722,10 @@ async fn backend_main(cfg: HostConfig, mut ctx: BackendCtx) -> Result<()> {
                                     let snap = fault_state.to_fault_snapshot();
                                     latest_fault_snap = snap.clone();
                                     ctx.fault_sink.offer(snap);
+                                }
+                                Ok(Some(DecodedCanMessage::GateDriver(gd_sw))) => {
+                                    latest_gd_snap.update(gd_sw);
+                                    let _ = ctx.gd_tx.try_send(latest_gd_snap);
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
@@ -809,6 +825,7 @@ enum DecodedCanMessage {
     Slow(SlowTelemetry),
     Fast(FastTelemetry),
     Fault(FaultStateSnapshot),
+    GateDriver(GateDriverSwitchTelemetry),
 }
 
 #[expect(

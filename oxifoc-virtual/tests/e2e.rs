@@ -17,7 +17,9 @@ use oxifoc_core::proto::oxifoc::{
     wire_message::Payload,
 };
 use oxifoc_core::runtime::servers::{CommsError, NmeaCanReceiver, encode_wire_message_frames};
-use oxifoc_core::types::{ControlMode, FastTelemetry, MotorCommand, MotorState, SlowTelemetry};
+use oxifoc_core::types::{
+    ControlMode, FastTelemetry, GateDriverSwitchTelemetry, MotorCommand, MotorState, SlowTelemetry,
+};
 
 const CAN_WIRE_FRAME_LEN: usize = 10;
 
@@ -35,6 +37,7 @@ enum DecodedTelemetry {
     Slow(SlowTelemetry),
     Fast(FastTelemetry),
     Fault(#[allow(dead_code)] FaultStateSnapshot),
+    GateDriver(#[allow(dead_code)] GateDriverSwitchTelemetry),
 }
 
 fn decode_rx_frame(rx: &mut NmeaCanReceiver, frame_bytes: &[u8]) -> Option<DecodedTelemetry> {
@@ -44,6 +47,9 @@ fn decode_rx_frame(rx: &mut NmeaCanReceiver, frame_bytes: &[u8]) -> Option<Decod
         Some(Payload::FaultState(flt)) => {
             Ok(DecodedTelemetry::Fault(FaultStateSnapshot::from(flt)))
         }
+        Some(Payload::GateDriverTelemetry(gd)) => Ok(DecodedTelemetry::GateDriver(
+            GateDriverSwitchTelemetry::from(gd),
+        )),
         _ => Err(CommsError::InvalidRequest),
     })
     .ok()
@@ -277,13 +283,19 @@ fn e2e_host_lib_to_virtual_over_vcan_multicast() {
         .expect("send Motor CurrentControl");
 
     let mut got_slow = false;
+    let mut got_gd = false;
     let mut spun = false;
     let deadline = Instant::now() + Duration::from_secs(8);
 
-    while Instant::now() < deadline && !(got_slow && spun) {
+    while Instant::now() < deadline && !(got_slow && got_gd && spun) {
         for slow in host.slow_rx.try_iter() {
             if slow.vbus_mv == 24_000 {
                 got_slow = true;
+            }
+        }
+        for gd in host.gd_rx.try_iter() {
+            if gd.populated_mask != 0 && gd.ready_count() > 0 {
+                got_gd = true;
             }
         }
         for fast in host.fast_rx.try_iter() {
@@ -297,6 +309,10 @@ fn e2e_host_lib_to_virtual_over_vcan_multicast() {
     assert!(
         got_slow,
         "oxifoc-host-lib should receive SlowTelemetry from oxifoc-virtual over vcan"
+    );
+    assert!(
+        got_gd,
+        "oxifoc-host-lib should receive GateDriverSnapshot from oxifoc-virtual over vcan"
     );
     assert!(
         spun,

@@ -34,9 +34,51 @@ use oxifoc_core::icd::{
 use oxifoc_core::runtime::servers::{
     CommsError, MessageSender, NmeaCanReceiver, run_telemetry_publishers, send_messages,
 };
+use oxifoc_core::runtime::streaming::publish_gate_driver_telemetry;
 use oxifoc_core::state::MotorControlState;
+use oxifoc_core::types::{GateDriverSwitch, GateDriverSwitchTelemetry};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
+
+/// Periodically publish simulated EiceDRIVER gate driver telemetry across all 6 switches (`UH`..`WL`).
+async fn run_virtual_gate_driver_publisher() {
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut rr_idx: usize = 0;
+    let mut seq: u32 = 0;
+    loop {
+        interval.tick().await;
+        let switch_id = GateDriverSwitch::ALL[rr_idx];
+        seq = seq.wrapping_add(1);
+        let temp_offset = (rr_idx as f32) * 0.4;
+        publish_gate_driver_telemetry(GateDriverSwitchTelemetry {
+            switch_id,
+            configured: true,
+            i2c_ok: true,
+            flt_n: true,
+            rdyc: true,
+            chip_rdy: true,
+            pri_rdy: true,
+            sec_rdy: true,
+            secuvevt: 0,
+            gfltevt: 0,
+            fltevt: 0,
+            pinstat: 0x05,
+            comerrst: 0,
+            chipstat: 0x08,
+            evtstick: 0,
+            uv1fcnt: 0,
+            uv2fcnt: 0,
+            d2ecnt: 0,
+            adcmvdif: 19.5,
+            adcmgnd2: 4.5,
+            adcmvcc2: 15.0,
+            adcmtemp: 33.5 + temp_offset,
+            board_temp_c_x10: 310,
+            seq,
+        });
+        rr_idx = (rr_idx + 1) % GateDriverSwitch::COUNT;
+    }
+}
 
 /// Resolve a CAN interface name (e.g. `"vcan0"`, `"mcast:vcan0"`, or
 /// `"239.255.79.88:29536"`) to its UDP Multicast Virtual CAN socket address.
@@ -127,7 +169,7 @@ async fn run_multicast(
         "UDP Multicast Virtual CAN server listening on {can_interface} -> {mcast_addr} (RX=0x7E5, TX=0x7ED)"
     );
 
-    // Spawn persistent background telemetry publishers (slow, fast, fault watches).
+    // Spawn persistent background telemetry publishers (slow, fast, fault, and gate driver watches).
     tokio::spawn(
         run_telemetry_publishers::<StandardFault, crate::TokioTimer>(
             state_mutex,
@@ -135,6 +177,7 @@ async fn run_multicast(
             foc_freq_hz,
         ),
     );
+    tokio::spawn(run_virtual_gate_driver_publisher());
 
     let boot_instant = Instant::now();
     let last_rx_ms = Arc::new(AtomicU64::new(0));
@@ -257,6 +300,7 @@ mod linux_socketcan {
                 foc_freq_hz,
             ),
         );
+        tokio::spawn(run_virtual_gate_driver_publisher());
 
         let boot_instant = Instant::now();
         let last_rx_ms = Arc::new(AtomicU64::new(0));

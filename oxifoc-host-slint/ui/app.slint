@@ -14,6 +14,23 @@ export struct FaultRow {
     category-id: int,   // FaultCategory discriminant, for per-row clear
 }
 
+export struct GateDriverSwitchRow {
+    name: string,
+    addr: string,
+    status: string,
+    has-fault: bool,
+    is-ready: bool,
+    pins: string,
+    rdy-flags: string,
+    vcc2: string,
+    gnd2: string,
+    vdif: string,
+    die-temp: string,
+    fault-events: string,
+    status-regs: string,
+    fault-counts: string,
+}
+
 component TelemetryValue inherits Rectangle {
     in property <string> label;
     in property <string> value;
@@ -153,11 +170,20 @@ export component App inherits Window {
     in property <string> iq-text:   "0";
     in property <string> vbus-text: "0.00 V";
     in property <string> temp-text: "0.0 °C";
+    in property <string> board-temp-text: "—";
     in property <string> erpm-text: "0";
     in property <string> rpm-text:  "0";
     in property <string> seq-text:  "0";
     in property <string> motor-state-text: "Stopped";
     in property <string> fault-text: "";
+
+    // ── EiceDRIVER gate driver telemetry ──
+    in property <[GateDriverSwitchRow]> gd-switches;
+    in property <string> gd-summary-text: "—";
+    in property <bool> gd-has-fault: false;
+    in property <string> gd-max-die-temp-text: "—";
+    in property <string> gd-seq-text: "0";
+    callback gd-clear-faults();
 
     // ── Chart textures and auto-range (set by Rust after each render) ──
     in property <image> currents-texture;
@@ -493,8 +519,14 @@ export component App inherits Window {
                             TelemetryValue { label: "Electrical RPM"; value: root.erpm-text; }
                             TelemetryValue { label: "RPM"; value: root.rpm-text; }
                             TelemetryValue { label: "FET temp"; value: root.temp-text; }
+                            TelemetryValue { label: "GD PCB temp"; value: root.board-temp-text; }
+                            TelemetryValue {
+                                label: "Gate drivers";
+                                value: root.gd-summary-text;
+                                value-color: root.gd-has-fault ? #d94b4b
+                                           : root.gd-summary-text == "—" ? root.muted-text : #239e75;
+                            }
                             TelemetryValue { label: "Angle source"; value: root.phase-source-text != "" ? root.phase-source-text : "—"; }
-                            TelemetryValue { label: "Sequence"; value: root.seq-text; }
                         }
                     }
                 }
@@ -543,6 +575,7 @@ export component App inherits Window {
                 }
                 Rectangle { horizontal-stretch: 1; }
                 Button { text: "Monitor"; primary: root.active-tab == 0; clicked => { root.active-tab = 0; } }
+                Button { text: "Gate Driver"; primary: root.active-tab == 5; clicked => { root.active-tab = 5; } }
                 Button { text: "Config"; primary: root.active-tab == 1; clicked => { root.active-tab = 1; } }
                 Button { text: "Detect"; primary: root.active-tab == 2; clicked => { root.active-tab = 2; } }
                 Button { text: "Faults"; primary: root.active-tab == 3;
@@ -680,7 +713,7 @@ export component App inherits Window {
                         y: root.chart-y(self.slot, chart-canvas.height);
                         width: root.chart-width(self.slot, chart-canvas.width);
                         height: root.chart-height(self.slot, chart-canvas.height);
-                        title: "FET temperature (°C)";
+                        title: "Temperatures (°C)";
                         texture: root.temp-texture;
                         available-samples: root.temp-available;
                         y-min: root.temp-y-min;
@@ -689,8 +722,8 @@ export component App inherits Window {
                         time-window: 2.0;
                         x-divisions: 4;
                         sample-rate: 10.0;
-                        legend-labels: ["FET"];
-                        legend-colors: [#ef4444];
+                        legend-labels: ["FET", "GD PCB", "GD Die"];
+                        legend-colors: [#ef4444, #f59e0b, #38bdf8];
                         focus-requested => { root.focus-chart(2); }
                     }
                     hall-plot := PlotWidget {
@@ -1025,6 +1058,176 @@ export component App inherits Window {
                 property <int> scroll-trigger: root.log-messages.length;
                 changed scroll-trigger => {
                     log-view.content-y = -100000px;
+                }
+            }
+
+            // ── Gate Driver (EiceDRIVER 1ED38x0Mc12M) tab ──
+            if root.active-tab == 5 : VerticalLayout {
+                padding: 10px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    cross-axis-alignment: center;
+                    Text {
+                        text: "Infineon EiceDRIVER 1ED38x0Mc12M Telemetry";
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
+                    Rectangle { width: 1px; height: 18px; background: root.panel-border; }
+                    Text {
+                        text: "Status: \{root.gd-summary-text}";
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: root.gd-has-fault ? #ef4444
+                             : root.gd-summary-text == "—" ? root.muted-text : #22c55e;
+                    }
+                    Text {
+                        text: "GD PCB: \{root.board-temp-text}";
+                        font-size: 12px;
+                        color: Palette.foreground;
+                    }
+                    Text {
+                        text: "Max Die: \{root.gd-max-die-temp-text}";
+                        font-size: 12px;
+                        color: Palette.foreground;
+                    }
+                    Text {
+                        text: "Seq: \{root.gd-seq-text}";
+                        font-size: 11px;
+                        color: root.muted-text;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Reset GD Faults (RDYC)";
+                        enabled: root.is-connected;
+                        clicked => { root.gd-clear-faults(); }
+                    }
+                }
+
+                // Column headers
+                Rectangle {
+                    height: 26px;
+                    background: Palette.alternate-background;
+                    border-radius: 4px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 6px;
+                        cross-axis-alignment: center;
+                        Text { text: "Switch"; width: 52px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "I2C"; width: 46px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "State"; width: 76px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "GPIO Pins"; width: 114px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "RDYSTAT"; width: 86px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "VCC2"; width: 64px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "GND2"; width: 64px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "VDIF"; width: 64px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "Die Temp"; width: 74px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "Fault Events"; width: 175px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "Status Regs"; horizontal-stretch: 1; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                        Text { text: "Counters"; width: 128px; font-size: 11px; font-weight: 700; color: root.muted-text; }
+                    }
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for sw[idx] in root.gd-switches : Rectangle {
+                        height: 40px;
+                        background: sw.has-fault ? #ef4444.transparentize(0.86) : Palette.alternate-background;
+                        border-width: 1px;
+                        border-color: sw.has-fault ? #ef4444 : root.panel-border;
+                        border-radius: 5px;
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            cross-axis-alignment: center;
+
+                            Text {
+                                text: sw.name;
+                                width: 52px;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: sw.addr;
+                                width: 46px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                color: root.muted-text;
+                            }
+                            Text {
+                                text: sw.status;
+                                width: 76px;
+                                font-size: 11px;
+                                font-weight: 700;
+                                color: sw.has-fault ? #ef4444
+                                     : sw.is-ready ? #22c55e
+                                     : root.muted-text;
+                            }
+                            Text {
+                                text: sw.pins;
+                                width: 114px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                            }
+                            Text {
+                                text: sw.rdy-flags;
+                                width: 86px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                            }
+                            Text {
+                                text: sw.vcc2;
+                                width: 64px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                font-weight: 600;
+                            }
+                            Text {
+                                text: sw.gnd2;
+                                width: 64px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                            }
+                            Text {
+                                text: sw.vdif;
+                                width: 64px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                            }
+                            Text {
+                                text: sw.die-temp;
+                                width: 74px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                font-weight: 600;
+                            }
+                            Text {
+                                text: sw.fault-events;
+                                width: 175px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                color: sw.has-fault ? #ef4444 : Palette.foreground;
+                            }
+                            Text {
+                                text: sw.status-regs;
+                                horizontal-stretch: 1;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: sw.fault-counts;
+                                width: 128px;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                color: root.muted-text;
+                            }
+                        }
+                    }
                 }
             }
 

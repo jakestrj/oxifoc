@@ -144,6 +144,44 @@ message FaultStateMessage {
   FaultSeverity max_severity = 5;
 }
 
+// Gate driver switch identifier (Infineon EiceDRIVER 1ED38x0Mc12M 6-switch bridge).
+enum GateDriverSwitch {
+  GATE_DRIVER_SWITCH_UH = 0;
+  GATE_DRIVER_SWITCH_UL = 1;
+  GATE_DRIVER_SWITCH_VH = 2;
+  GATE_DRIVER_SWITCH_VL = 3;
+  GATE_DRIVER_SWITCH_WH = 4;
+  GATE_DRIVER_SWITCH_WL = 5;
+}
+
+// Per-switch EiceDRIVER gate driver telemetry and status (device -> host).
+message GateDriverTelemetryMessage {
+  GateDriverSwitch switch_id = 1;
+  bool configured = 2;
+  bool i2c_ok = 3;
+  bool flt_n = 4;
+  bool rdyc = 5;
+  bool chip_rdy = 6;
+  bool pri_rdy = 7;
+  bool sec_rdy = 8;
+  uint32 secuvevt = 9;
+  uint32 gfltevt = 10;
+  uint32 fltevt = 11;
+  uint32 pinstat = 12;
+  uint32 comerrst = 13;
+  uint32 chipstat = 14;
+  uint32 evtstick = 15;
+  uint32 uv1fcnt = 16;
+  uint32 uv2fcnt = 17;
+  uint32 d2ecnt = 18;
+  float adcmvdif = 19;
+  float adcmgnd2 = 20;
+  float adcmvcc2 = 21;
+  float adcmtemp = 22;
+  int32 board_temp_c_x10 = 23;
+  uint32 seq = 24;
+}
+
 // Sequenced motor command request (host -> device).
 message MotorCommandRequest {
   uint64 source_session = 1;
@@ -185,6 +223,7 @@ message WireMessage {
     SlowTelemetryMessage slow_telemetry = 1 [(common.payload_source) = OXIFOC];
     FastTelemetryMessage fast_telemetry = 2 [(common.payload_source) = OXIFOC];
     FaultStateMessage fault_state = 3 [(common.payload_source) = OXIFOC];
+    GateDriverTelemetryMessage gate_driver_telemetry = 4 [(common.payload_source) = OXIFOC];
 
     // Host -> Device commands
     MotorCommandRequest motor_command = 10 [(common.payload_source) = HOST];

@@ -17,7 +17,7 @@ use core::sync::atomic::Ordering;
 
 use critical_section::Mutex as CriticalSectionMutex;
 use embassy_futures::join::join3;
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either4, select4};
 use femtopb::{EnumValue, UnknownFields};
 use nmea::nmea_message::{MAX_NMEA_PACKET_SIZE, Message as NmeaMessage};
 use streaming_protocol::decoder::Decoder;
@@ -28,8 +28,9 @@ use crate::foc::phase::PhaseSource;
 use crate::icd::{DECODER_BUF_LEN, ENCODER_BUF_LEN, MSG_ID, MotorRequest};
 use crate::proto::oxifoc::{WireMessage, wire_message::Payload};
 use crate::runtime::streaming::{
-    FAST_TELEM_PERIOD, FAST_TELEMETRY_WATCH, FAULT_STATE_WATCH, SLOW_TELEMETRY_WATCH, cmd_stats,
-    fast_telem_stats, fast_telemetry_stream, fault_topic_stream, slow_telemetry_stream,
+    FAST_TELEM_PERIOD, FAST_TELEMETRY_WATCH, FAULT_STATE_WATCH, GATE_DRIVER_TELEMETRY_WATCH,
+    SLOW_TELEMETRY_WATCH, cmd_stats, fast_telem_stats, fast_telemetry_stream, fault_topic_stream,
+    slow_telemetry_stream,
 };
 use crate::state::{CMD_CHANNEL, DriverCommand, MotorControlState};
 use crate::timer::Timer;
@@ -87,8 +88,9 @@ pub fn encode_wire_message_frames(msg: &WireMessage<'_>) -> Result<NmeaMessage, 
     Ok(NmeaMessage::from_payload(slice, 0))
 }
 
-/// Continuously watch `SLOW_TELEMETRY_WATCH`, `FAST_TELEMETRY_WATCH`, and
-/// `FAULT_STATE_WATCH` and transmit updates via `sender`.
+/// Continuously watch `SLOW_TELEMETRY_WATCH`, `FAST_TELEMETRY_WATCH`,
+/// `FAULT_STATE_WATCH`, and `GATE_DRIVER_TELEMETRY_WATCH` and transmit updates
+/// via `sender`.
 pub async fn send_messages<T: MessageSender>(sender: &mut T) {
     let Some(mut slow_rx) = SLOW_TELEMETRY_WATCH.receiver() else {
         return;
@@ -99,23 +101,36 @@ pub async fn send_messages<T: MessageSender>(sender: &mut T) {
     let Some(mut fault_rx) = FAULT_STATE_WATCH.receiver() else {
         return;
     };
+    let Some(mut gd_rx) = GATE_DRIVER_TELEMETRY_WATCH.receiver() else {
+        return;
+    };
 
     loop {
-        let msg: WireMessage<'_> =
-            match select3(slow_rx.changed(), fast_rx.changed(), fault_rx.changed()).await {
-                Either3::First(slow) => WireMessage {
-                    payload: Some(Payload::SlowTelemetry(slow.into())),
-                    unknown_fields: UnknownFields::empty(),
-                },
-                Either3::Second(fast) => WireMessage {
-                    payload: Some(Payload::FastTelemetry(fast.into())),
-                    unknown_fields: UnknownFields::empty(),
-                },
-                Either3::Third(fault) => WireMessage {
-                    payload: Some(Payload::FaultState(fault.into())),
-                    unknown_fields: UnknownFields::empty(),
-                },
-            };
+        let msg: WireMessage<'_> = match select4(
+            slow_rx.changed(),
+            fast_rx.changed(),
+            fault_rx.changed(),
+            gd_rx.changed(),
+        )
+        .await
+        {
+            Either4::First(slow) => WireMessage {
+                payload: Some(Payload::SlowTelemetry(slow.into())),
+                unknown_fields: UnknownFields::empty(),
+            },
+            Either4::Second(fast) => WireMessage {
+                payload: Some(Payload::FastTelemetry(fast.into())),
+                unknown_fields: UnknownFields::empty(),
+            },
+            Either4::Third(fault) => WireMessage {
+                payload: Some(Payload::FaultState(fault.into())),
+                unknown_fields: UnknownFields::empty(),
+            },
+            Either4::Fourth(gd) => WireMessage {
+                payload: Some(Payload::GateDriverTelemetry(gd.into())),
+                unknown_fields: UnknownFields::empty(),
+            },
+        };
 
         if sender.send_message(msg).await.is_ok() {
             fast_telem_stats::BCAST_OK.fetch_add(1, Ordering::Relaxed);
@@ -187,9 +202,11 @@ pub fn process_wire_message<F: PlatformFault>(
             let _ = CMD_CHANNEL.try_send(DriverCommand::SetPhaseSource(source));
             Ok(())
         }
-        Payload::SlowTelemetry(_) | Payload::FastTelemetry(_) | Payload::FaultState(_) | _ => {
-            Err(CommsError::InvalidRequest)
-        }
+        Payload::SlowTelemetry(_)
+        | Payload::FastTelemetry(_)
+        | Payload::FaultState(_)
+        | Payload::GateDriverTelemetry(_)
+        | _ => Err(CommsError::InvalidRequest),
     }
 }
 
@@ -410,6 +427,54 @@ mod tests {
             }
         }
         assert_eq!(decoded_fault.unwrap(), fault_snap);
+
+        // GateDriverSwitchTelemetry roundtrip
+        let gd = crate::types::GateDriverSwitchTelemetry {
+            switch_id: crate::types::GateDriverSwitch::Vh,
+            configured: true,
+            i2c_ok: true,
+            flt_n: true,
+            rdyc: true,
+            chip_rdy: true,
+            pri_rdy: true,
+            sec_rdy: true,
+            secuvevt: 0,
+            gfltevt: 0,
+            fltevt: 0,
+            pinstat: 0x05,
+            comerrst: 0,
+            chipstat: 0x02,
+            evtstick: 0,
+            uv1fcnt: 1,
+            uv2fcnt: 2,
+            d2ecnt: 3,
+            adcmvdif: 19.5,
+            adcmgnd2: 4.5,
+            adcmvcc2: 15.0,
+            adcmtemp: 42.5,
+            board_temp_c_x10: 365,
+            seq: 17,
+        };
+        let gd_wire = WireMessage {
+            payload: Some(Payload::GateDriverTelemetry(gd.into())),
+            unknown_fields: UnknownFields::empty(),
+        };
+        let mut nmea_tx = encode_wire_message_frames(&gd_wire).unwrap();
+        let mut decoded_gd = None;
+        while let Some(frame) = nmea_tx.pop_frame() {
+            if let Some(res) = rx
+                .push_frame_with(&frame.bytes, |proto| match proto.payload.as_ref() {
+                    Some(Payload::GateDriverTelemetry(m)) => {
+                        Ok(crate::types::GateDriverSwitchTelemetry::from(m))
+                    }
+                    _ => Err(CommsError::InvalidRequest),
+                })
+                .unwrap()
+            {
+                decoded_gd = Some(res);
+            }
+        }
+        assert_eq!(decoded_gd.unwrap(), gd);
     }
 
     #[test]

@@ -177,6 +177,60 @@ pub struct FaultStateMessage<'a> {
     #[femtopb(unknown_fields)]
     pub unknown_fields: femtopb::UnknownFields<'a>,
 }
+/// Per-switch EiceDRIVER gate driver telemetry and status (device -> host).
+#[derive(Clone, Copy, PartialEq, ::femtopb::Message)]
+pub struct GateDriverTelemetryMessage<'a> {
+    #[femtopb(enumeration, tag = 1)]
+    pub switch_id: ::femtopb::enumeration::EnumValue<GateDriverSwitch>,
+    #[femtopb(bool, tag = 2)]
+    pub configured: bool,
+    #[femtopb(bool, tag = 3)]
+    pub i2c_ok: bool,
+    #[femtopb(bool, tag = 4)]
+    pub flt_n: bool,
+    #[femtopb(bool, tag = 5)]
+    pub rdyc: bool,
+    #[femtopb(bool, tag = 6)]
+    pub chip_rdy: bool,
+    #[femtopb(bool, tag = 7)]
+    pub pri_rdy: bool,
+    #[femtopb(bool, tag = 8)]
+    pub sec_rdy: bool,
+    #[femtopb(uint32, tag = 9)]
+    pub secuvevt: u32,
+    #[femtopb(uint32, tag = 10)]
+    pub gfltevt: u32,
+    #[femtopb(uint32, tag = 11)]
+    pub fltevt: u32,
+    #[femtopb(uint32, tag = 12)]
+    pub pinstat: u32,
+    #[femtopb(uint32, tag = 13)]
+    pub comerrst: u32,
+    #[femtopb(uint32, tag = 14)]
+    pub chipstat: u32,
+    #[femtopb(uint32, tag = 15)]
+    pub evtstick: u32,
+    #[femtopb(uint32, tag = 16)]
+    pub uv1fcnt: u32,
+    #[femtopb(uint32, tag = 17)]
+    pub uv2fcnt: u32,
+    #[femtopb(uint32, tag = 18)]
+    pub d2ecnt: u32,
+    #[femtopb(float, tag = 19)]
+    pub adcmvdif: f32,
+    #[femtopb(float, tag = 20)]
+    pub adcmgnd2: f32,
+    #[femtopb(float, tag = 21)]
+    pub adcmvcc2: f32,
+    #[femtopb(float, tag = 22)]
+    pub adcmtemp: f32,
+    #[femtopb(int32, tag = 23)]
+    pub board_temp_c_x10: i32,
+    #[femtopb(uint32, tag = 24)]
+    pub seq: u32,
+    #[femtopb(unknown_fields)]
+    pub unknown_fields: femtopb::UnknownFields<'a>,
+}
 /// Sequenced motor command request (host -> device).
 #[derive(Clone, Copy, PartialEq, ::femtopb::Message)]
 pub struct MotorCommandRequest<'a> {
@@ -234,7 +288,7 @@ pub struct PhaseSourceRequest<'a> {
 /// Top-level wire message encoded with streaming-protocol and fragmented via NMEA over CAN.
 #[derive(Clone, Copy, PartialEq, ::femtopb::Message)]
 pub struct WireMessage<'a> {
-    #[femtopb(oneof, tags = [1, 2, 3, 10, 11, 12, 13])]
+    #[femtopb(oneof, tags = [1, 2, 3, 4, 10, 11, 12, 13])]
     pub payload: ::core::option::Option<wire_message::Payload<'a>>,
     #[femtopb(unknown_fields)]
     pub unknown_fields: femtopb::UnknownFields<'a>,
@@ -251,6 +305,8 @@ pub mod wire_message {
         FastTelemetry(super::FastTelemetryMessage<'a>),
         #[femtopb(message, tag = 3)]
         FaultState(super::FaultStateMessage<'a>),
+        #[femtopb(message, tag = 4)]
+        GateDriverTelemetry(super::GateDriverTelemetryMessage<'a>),
         /// Host -> Device commands
         #[femtopb(message, tag = 10)]
         MotorCommand(super::MotorCommandRequest<'a>),
@@ -483,6 +539,57 @@ impl PhaseSourceKind {
             "PHASE_SOURCE_HFI_TO_OBSERVER_VOLTS" => {
                 Some(Self::PhaseSourceHfiToObserverVolts)
             }
+            _ => None,
+        }
+    }
+}
+/// Gate driver switch identifier (Infineon EiceDRIVER 1ED38x0Mc12M 6-switch bridge).
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    ::femtopb::Enumeration
+)]
+#[repr(i32)]
+#[derive(Default)]
+pub enum GateDriverSwitch {
+    #[default]
+    Uh = 0,
+    Ul = 1,
+    Vh = 2,
+    Vl = 3,
+    Wh = 4,
+    Wl = 5,
+}
+impl GateDriverSwitch {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Uh => "GATE_DRIVER_SWITCH_UH",
+            Self::Ul => "GATE_DRIVER_SWITCH_UL",
+            Self::Vh => "GATE_DRIVER_SWITCH_VH",
+            Self::Vl => "GATE_DRIVER_SWITCH_VL",
+            Self::Wh => "GATE_DRIVER_SWITCH_WH",
+            Self::Wl => "GATE_DRIVER_SWITCH_WL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "GATE_DRIVER_SWITCH_UH" => Some(Self::Uh),
+            "GATE_DRIVER_SWITCH_UL" => Some(Self::Ul),
+            "GATE_DRIVER_SWITCH_VH" => Some(Self::Vh),
+            "GATE_DRIVER_SWITCH_VL" => Some(Self::Vl),
+            "GATE_DRIVER_SWITCH_WH" => Some(Self::Wh),
+            "GATE_DRIVER_SWITCH_WL" => Some(Self::Wl),
             _ => None,
         }
     }

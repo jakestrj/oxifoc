@@ -186,7 +186,8 @@ pub async fn foc_loop(
             seq = seq.wrapping_add(1);
             let [ia, ib, ic] = driver.current_sensor().raw;
             let adc = AdcSnapshot::new(ia, ib, ic, (vbus * 1000.0) as u32, seq)
-                .with_temp(TempSensorId::Fet, 250);
+                .with_temp(TempSensorId::Fet, 250)
+                .with_temp(TempSensorId::Board, 310);
             // Protection consumes the previous ADC snapshot on boards. Publish
             // this cycle's ADC together with FOC below, preserving that order.
             let telem = run_foc_cycle(state_mutex, fault_registry, &mut driver, vbus, now, &board)

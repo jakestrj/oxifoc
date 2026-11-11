@@ -12,12 +12,14 @@ pub use generated::*;
 mod configuration;
 mod detection;
 mod faults;
+mod gate_driver;
 mod logging;
 pub mod mcap;
 mod motor;
 mod presets;
 
 use faults::apply_faults;
+use gate_driver::apply_gate_driver_snapshot;
 use logging::UiLogLayer;
 
 type SharedRuntime = Arc<std::sync::Mutex<Option<HostRuntime>>>;
@@ -136,9 +138,10 @@ pub fn main() {
 
     let app = App::new().unwrap();
 
-    // ── Log + faults models ──────────────────────────────────────────────────
+    // ── Log + faults + gate driver models ───────────────────────────────────
     app.set_log_messages(ModelRc::new(VecModel::<LogMessage>::default()));
     app.set_faults(ModelRc::new(VecModel::<FaultRow>::default()));
+    app.set_gd_switches(ModelRc::new(VecModel::from(gate_driver::default_rows())));
 
     logging::bind(&app, log_rx);
 
@@ -182,8 +185,9 @@ pub fn main() {
     // ── Ring buffers shared between data thread and render notifier ───────────
     let currents_buf = Arc::new(PlotBuffer::new(5, CAPACITY)); // ia, ib, ic, id, iq
     let vbus_buf = Arc::new(PlotBuffer::new(1, CAPACITY)); // V
-    let temp_buf = Arc::new(PlotBuffer::new(1, CAPACITY)); // °C
+    let temp_buf = Arc::new(PlotBuffer::new(3, CAPACITY)); // FET °C, GD PCB °C, GD Die °C
     let hall_buf = Arc::new(PlotBuffer::new(2, CAPACITY)); // angle_rad, erpm/1000
+    let latest_gd_die_temp_bits = Arc::new(std::sync::atomic::AtomicU32::new(f32::NAN.to_bits()));
 
     // Raw→engineering enrichment context (device BoardCalib + dc_offsets +
     // pole_pairs). Built by the device-info listener on connect; read by the
@@ -217,6 +221,7 @@ pub fn main() {
         let fhz = fast_hz.clone();
         let frx = fast_rx_slot.clone();
         let srx = slow_rx_slot.clone();
+        let gd_die_bits = latest_gd_die_temp_bits.clone();
         let conn = connected_flag.clone();
         let motor_pending = motor_update_pending.clone();
         let motor_rt = runtime.clone();
@@ -272,12 +277,16 @@ pub fn main() {
                             device,
                             queue,
                             PlotConfig {
-                                num_channels: 1,
+                                num_channels: 3,
                                 capacity: CAPACITY,
                                 y_min: 0.0,
                                 y_max: 150.0,
                                 auto_range: true,
-                                channel_colors: vec![[0.937, 0.267, 0.267, 1.0]], // red
+                                channel_colors: vec![
+                                    [0.937, 0.267, 0.267, 1.0], // red   – FET
+                                    [0.961, 0.620, 0.043, 1.0], // amber – GD PCB
+                                    [0.220, 0.741, 0.973, 1.0], // sky   – GD Die
+                                ],
                             },
                         ));
                         hr = Some(PlotRenderer::new(
@@ -366,7 +375,16 @@ pub fn main() {
                                 vb.push_frame(&[sample.vbus_mv as f32 / 1000.0]);
                             }
                             if !temp_paused {
-                                tb.push_frame(&[f32::from(sample.fet_temp_c_x10) / 10.0]);
+                                let fet_c = f32::from(sample.fet_temp_c_x10) / 10.0;
+                                let board_c = if sample.board_temp_c_x10 != 0
+                                    && sample.board_temp_c_x10 > -3000
+                                {
+                                    f32::from(sample.board_temp_c_x10) / 10.0
+                                } else {
+                                    f32::NAN
+                                };
+                                let gd_die_c = f32::from_bits(gd_die_bits.load(Ordering::Relaxed));
+                                tb.push_frame(&[fet_c, board_c, gd_die_c]);
                             }
                             last_slow = Some(sample);
                         }
@@ -449,6 +467,12 @@ pub fn main() {
                                 "{:.1} °C",
                                 f32::from(s.fet_temp_c_x10) / 10.0
                             )));
+                            if s.board_temp_c_x10 != 0 && s.board_temp_c_x10 > -3000 {
+                                app.set_board_temp_text(SharedString::from(format!(
+                                    "{:.1} °C",
+                                    f32::from(s.board_temp_c_x10) / 10.0
+                                )));
+                            }
                             let state_str = format!("{:?}", s.motor_state);
                             app.set_motor_state_text(SharedString::from(state_str));
                             app.set_motor_running(s.motor_state == MotorState::Running);
@@ -546,7 +570,7 @@ pub fn main() {
                                 t_vis,
                                 t_off,
                                 10.0,
-                                &["°C"],
+                                &["FET", "GD PCB", "GD Die"],
                                 None,
                             )
                         } else {
@@ -682,6 +706,7 @@ pub fn main() {
         let esl_connect = enrich_slot.clone();
         let fhz = fast_hz.clone();
         let mcap_rec = mcap_recorder.clone();
+        let gd_die_connect = latest_gd_die_temp_bits.clone();
 
         app.on_connect_device(move || {
             let app = weak.unwrap();
@@ -723,6 +748,7 @@ pub fn main() {
             let slow_rx = host_runtime.slow_rx.clone();
             let info_rx = host_runtime.device_info_rx.clone();
             let fault_rx = host_runtime.fault_rx.clone();
+            let gd_rx = host_runtime.gd_rx.clone();
             let wire_rx = host_runtime.wire_rx.clone();
             let connected = host_runtime.connected.clone();
             let runtime_fast_hz = host_runtime.fast_hz.clone();
@@ -766,6 +792,30 @@ pub fn main() {
                                 {
                                     tracing::error!("MCAP write failed: {e}");
                                 }
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                });
+            }
+
+            // Gate driver telemetry listener — mirrors EiceDRIVER per-switch
+            // status, voltages, and die temperatures into the UI model and
+            // temperature chart.
+            {
+                let weak_gd = weak.clone();
+                let stop_gd = stop.clone();
+                let gd_die = gd_die_connect.clone();
+                thread::spawn(move || {
+                    while !stop_gd.load(Ordering::Relaxed) {
+                        match gd_rx.recv_timeout(Duration::from_millis(200)) {
+                            Ok(snap) => {
+                                let max_die = snap.max_die_temp_c().unwrap_or(f32::NAN);
+                                gd_die.store(max_die.to_bits(), Ordering::Relaxed);
+                                let _ = weak_gd.upgrade_in_event_loop(move |app| {
+                                    apply_gate_driver_snapshot(&app, &snap);
+                                });
                             }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -887,9 +937,11 @@ pub fn main() {
         let srx_slot = slow_rx_slot.clone();
         let conn_flag = connected_flag.clone();
         let mcap_rec = mcap_recorder.clone();
+        let gd_die_disconnect = latest_gd_die_temp_bits.clone();
         app.on_disconnect_device(move || {
             stop.store(true, Ordering::Relaxed);
             conn_flag.store(false, Ordering::Relaxed);
+            gd_die_disconnect.store(f32::NAN.to_bits(), Ordering::Relaxed);
             *frx_slot.lock().unwrap() = None;
             *srx_slot.lock().unwrap() = None;
             if let Some(runtime) = rt.lock().unwrap().take() {
@@ -905,6 +957,11 @@ pub fn main() {
             app.set_motor_running(false);
             app.set_motor_command_pending(false);
             app.set_motor_status(SharedString::from(""));
+            app.set_gd_switches(ModelRc::new(VecModel::from(gate_driver::default_rows())));
+            app.set_gd_summary_text(SharedString::from("—"));
+            app.set_gd_has_fault(false);
+            app.set_gd_max_die_temp_text(SharedString::from("—"));
+            app.set_board_temp_text(SharedString::from("—"));
         });
     }
 
@@ -917,6 +974,7 @@ pub fn main() {
     configuration::bind(&app, &runtime);
     detection::bind(&app, &runtime);
     faults::bind(&app, &runtime);
+    gate_driver::bind(&app, &runtime);
     mcap::bind(&app, &mcap_recorder);
 
     app.run().unwrap();

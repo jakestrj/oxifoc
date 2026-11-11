@@ -28,6 +28,8 @@ use embassy_stm32::time::Hertz;
 use embassy_time::{Duration, Ticker, Timer};
 use oxifoc_core::foc::config::NtcConfig;
 use oxifoc_core::foc::fault::FaultCategory;
+use oxifoc_core::runtime::streaming::publish_gate_driver_telemetry;
+use oxifoc_core::types::{GateDriverSwitch, GateDriverSwitchTelemetry};
 
 use super::resources::{DrvResources, MotorResources};
 use crate::FAULT_REGISTRY;
@@ -247,7 +249,7 @@ pub static GD_BOARD_TEMP_C_X10: AtomicI16 = AtomicI16::new(NtcConfig::INVALID_TE
 pub struct EiceDriverMonitor {
     i2c: I2c<'static, Blocking, Master>,
     rdyc: [Flex<'static>; 6],
-    _flt_n: [Input<'static>; 6],
+    flt_n: [Input<'static>; 6],
 }
 
 // ============================================================================
@@ -362,14 +364,7 @@ pub async fn configure_all(
         Some(err) => Err(err),
     };
 
-    (
-        EiceDriverMonitor {
-            i2c,
-            rdyc,
-            _flt_n: flt_n,
-        },
-        result,
-    )
+    (EiceDriverMonitor { i2c, rdyc, flt_n }, result)
 }
 
 async fn configure_single_driver(
@@ -447,13 +442,13 @@ fn is_driver_configured(i2c: &mut I2c<'static, Blocking, Master>, dev_addr: u8) 
 }
 
 /// Read all 16 status registers starting at `REG_RDYSTAT` (`eicedriver_read_status`).
-fn read_driver_status(
+fn read_driver_status_bytes(
     i2c: &mut I2c<'static, Blocking, Master>,
     dev_addr: u8,
-) -> Result<EiceDriverValues, i2c::Error> {
+) -> Result<[u8; 16], i2c::Error> {
     let mut rx = [0u8; 16];
     i2c.blocking_read(dev_addr, &mut rx)?;
-    Ok(EiceDriverValues::from_status_bytes(&rx))
+    Ok(rx)
 }
 
 /// Read the 12-bit GD PCB temperature sensor (`0x48`, reg `0x00`) and store `0.1 °C` in
@@ -567,19 +562,40 @@ pub async fn eicedriver_monitor_task(mut monitor: EiceDriverMonitor, gd_configur
     let mut ticker = Ticker::every(Duration::from_millis(100));
     let mut hw_fault_latched = false;
     let mut last_logged: Option<EiceDriverFaultStatus> = None;
+    let mut rr_switch_idx: usize = 0;
+    let mut telem_seq: u32 = 0;
 
     loop {
         ticker.next().await;
 
-        if poll_gd_pcb_temp(&mut monitor.i2c).is_err() {
-            GD_BOARD_TEMP_C_X10.store(NtcConfig::INVALID_TEMP_C_X10, Ordering::Relaxed);
-            try_restore_i2c(&mut monitor.i2c).await;
-        }
+        let board_temp_c_x10 = match poll_gd_pcb_temp(&mut monitor.i2c) {
+            Ok(temp) => temp,
+            Err(_) => {
+                GD_BOARD_TEMP_C_X10.store(NtcConfig::INVALID_TEMP_C_X10, Ordering::Relaxed);
+                try_restore_i2c(&mut monitor.i2c).await;
+                0
+            }
+        };
 
         if !gd_configured {
             // Boot configuration failed: keep DriverFault asserted even if the host
             // sends a clear command so unconfigured IGBT drivers can never be switched.
             FAULT_REGISTRY.set(F405Fault::DrvConfigFailed);
+            let switch_id = GateDriverSwitch::ALL[rr_switch_idx];
+            let flt_n = monitor.flt_n[rr_switch_idx].is_high();
+            let rdyc = monitor.rdyc[rr_switch_idx].is_high();
+            telem_seq = telem_seq.wrapping_add(1);
+            publish_gate_driver_telemetry(GateDriverSwitchTelemetry {
+                switch_id,
+                configured: false,
+                i2c_ok: false,
+                flt_n,
+                rdyc,
+                board_temp_c_x10,
+                seq: telem_seq,
+                ..GateDriverSwitchTelemetry::default()
+            });
+            rr_switch_idx = (rr_switch_idx + 1) % GateDriverSwitch::COUNT;
             continue;
         }
 
@@ -596,26 +612,64 @@ pub async fn eicedriver_monitor_task(mut monitor: EiceDriverMonitor, gd_configur
         let mut unready_mask: u8 = 0;
         let mut first_fault: Option<(u8, EiceDriverValues)> = None;
         let mut first_i2c_err_sw: Option<u8> = None;
+        let mut switch_telemetry = [GateDriverSwitchTelemetry::default(); GateDriverSwitch::COUNT];
 
         for (idx, sw) in SWITCHES.iter().enumerate() {
             let bit = 1u8 << idx;
-            match read_driver_status(&mut monitor.i2c, sw.dev_addr) {
-                Ok(vals) => {
-                    if vals.rdy_raw != RDYSTAT_ALL_READY {
+            let switch_id = GateDriverSwitch::ALL[idx];
+            let flt_n = monitor.flt_n[idx].is_high();
+            let rdyc = monitor.rdyc[idx].is_high();
+            telem_seq = telem_seq.wrapping_add(1);
+
+            match read_driver_status_bytes(&mut monitor.i2c, sw.dev_addr) {
+                Ok(rx) => {
+                    let vals = EiceDriverValues::from_status_bytes(&rx);
+                    if vals.rdy_raw != RDYSTAT_ALL_READY || !flt_n || !rdyc {
                         unready_mask |= bit;
                     }
-                    if vals.has_fault_or_unready() && first_fault.is_none() {
+                    if (vals.has_fault_or_unready() || !flt_n || !rdyc) && first_fault.is_none() {
                         first_fault = Some((idx as u8, vals));
                     }
+                    switch_telemetry[idx] = GateDriverSwitchTelemetry::from_status_bytes(
+                        switch_id,
+                        &rx,
+                        flt_n,
+                        rdyc,
+                        board_temp_c_x10,
+                        telem_seq,
+                    );
                 }
                 Err(_) => {
                     i2c_err_mask |= bit;
                     if first_i2c_err_sw.is_none() {
                         first_i2c_err_sw = Some(idx as u8);
                     }
+                    switch_telemetry[idx] = GateDriverSwitchTelemetry {
+                        switch_id,
+                        configured: true,
+                        i2c_ok: false,
+                        flt_n,
+                        rdyc,
+                        board_temp_c_x10,
+                        seq: telem_seq,
+                        ..GateDriverSwitchTelemetry::default()
+                    };
                 }
             }
         }
+
+        // Publish the first faulted/unready switch immediately so the host sees
+        // diagnostic registers right away; otherwise advance round-robin across UH..WL.
+        let publish_idx = if let Some((sw_idx, _)) = first_fault {
+            usize::from(sw_idx)
+        } else if let Some(sw_idx) = first_i2c_err_sw {
+            usize::from(sw_idx)
+        } else {
+            let idx = rr_switch_idx;
+            rr_switch_idx = (rr_switch_idx + 1) % GateDriverSwitch::COUNT;
+            idx
+        };
+        publish_gate_driver_telemetry(switch_telemetry[publish_idx]);
 
         if i2c_err_mask != 0 {
             try_restore_i2c(&mut monitor.i2c).await;

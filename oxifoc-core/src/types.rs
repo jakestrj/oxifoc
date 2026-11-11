@@ -518,6 +518,298 @@ pub struct SlowTelemetry {
     pub derate_regen_pct: u8,
 }
 
+// ============================================================================
+// Gate Driver Telemetry Types (Infineon EiceDRIVER 1ED38x0Mc12M)
+// ============================================================================
+
+/// Identifier for one of the 6 EiceDRIVER gate driver switches in a 3-phase bridge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Schema)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum GateDriverSwitch {
+    /// Phase U high-side switch (I2C `0x0E`)
+    #[default]
+    Uh = 0,
+    /// Phase U low-side switch (I2C `0x0F`)
+    Ul = 1,
+    /// Phase V high-side switch (I2C `0x10`)
+    Vh = 2,
+    /// Phase V low-side switch (I2C `0x11`)
+    Vl = 3,
+    /// Phase W high-side switch (I2C `0x12`)
+    Wh = 4,
+    /// Phase W low-side switch (I2C `0x13`)
+    Wl = 5,
+}
+
+impl GateDriverSwitch {
+    /// Total number of gate driver switches in a 3-phase bridge.
+    pub const COUNT: usize = 6;
+
+    /// All 6 gate driver switches in address order (`UH`..`WL`).
+    pub const ALL: [Self; Self::COUNT] =
+        [Self::Uh, Self::Ul, Self::Vh, Self::Vl, Self::Wh, Self::Wl];
+
+    /// 0-based index (`0..6`).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Convert from a 0-based switch index (`0..6`).
+    #[must_use]
+    pub const fn from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(Self::Uh),
+            1 => Some(Self::Ul),
+            2 => Some(Self::Vh),
+            3 => Some(Self::Vl),
+            4 => Some(Self::Wh),
+            5 => Some(Self::Wl),
+            _ => None,
+        }
+    }
+
+    /// Short human-readable label (`"UH"`, `"UL"`, etc.).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Uh => "UH",
+            Self::Ul => "UL",
+            Self::Vh => "VH",
+            Self::Vl => "VL",
+            Self::Wh => "WH",
+            Self::Wl => "WL",
+        }
+    }
+
+    /// Configured 7-bit I2C address (`0x0E..=0x13`).
+    #[must_use]
+    pub const fn i2c_addr(self) -> u8 {
+        0x0E + (self as u8)
+    }
+}
+
+/// Telemetry and status registers for a single EiceDRIVER 1ED38x0Mc12M switch.
+///
+/// Mirrors `gd_values` in `bldc-custom/eicedriver` (`eicedriver.c` / `commands.c`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Schema)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct GateDriverSwitchTelemetry {
+    /// Which bridge switch this telemetry belongs to.
+    pub switch_id: GateDriverSwitch,
+    /// True if all 6 gate driver ICs completed startup I2C enumeration.
+    pub configured: bool,
+    /// True if the most recent 16-byte I2C status read succeeded.
+    pub i2c_ok: bool,
+    /// Physical `FLT_N` pin state (`true` = high / no active fault pull-down).
+    pub flt_n: bool,
+    /// Physical `RDYC` pin state (`true` = high / ready).
+    pub rdyc: bool,
+    /// `RDYSTAT[0]` — chip ready.
+    pub chip_rdy: bool,
+    /// `RDYSTAT[1]` — primary-side ready.
+    pub pri_rdy: bool,
+    /// `RDYSTAT[2]` — secondary-side ready.
+    pub sec_rdy: bool,
+    /// `SECUVEVT` (`0x1D`) — secondary supply undervoltage event flags.
+    pub secuvevt: u8,
+    /// `GFLTEVT` (`0x1E`) — gate fault event flags.
+    pub gfltevt: u8,
+    /// `FLTEVT` (`0x1F`) — primary fault event flags (DESAT, SCP, OTSD, etc.).
+    pub fltevt: u8,
+    /// `PINSTAT` (`0x20`) — input/output pin status.
+    pub pinstat: u8,
+    /// `COMERRST` (`0x21`) — Primary-to-secondary / I2C communication error status.
+    pub comerrst: u8,
+    /// `CHIPSTAT` (`0x22`) — internal chip state machine status.
+    pub chipstat: u8,
+    /// `EVTSTICK` (`0x23`) — sticky event summary register.
+    pub evtstick: u8,
+    /// `UV1FCNT` (`0x24`) — primary supply undervoltage fault counter.
+    pub uv1fcnt: u8,
+    /// `UV2FCNT` (`0x25`) — secondary supply undervoltage fault counter.
+    pub uv2fcnt: u8,
+    /// `D2ECNT` (`0x26`) — chip-to-chip communication error counter.
+    pub d2ecnt: u8,
+    /// `ADCMVDIF` (`0x27`) — differential voltage in Volts (`raw / 6.6`).
+    pub adcmvdif: f32,
+    /// `ADCMGND2` (`0x28`) — secondary ground shift / negative supply in Volts (`raw / 6.6`).
+    pub adcmgnd2: f32,
+    /// `ADCMVCC2` (`0x29`) — secondary positive supply in Volts (`raw / 6.6`).
+    pub adcmvcc2: f32,
+    /// `ADCMTEMP` (`0x2A`) — gate driver die temperature in °C (`raw * 3.22 - 275.0`).
+    pub adcmtemp: f32,
+    /// Gate driver PCB temperature in 0.1 °C units (`0x48` I2C sensor).
+    pub board_temp_c_x10: i16,
+    /// Monotonic telemetry sequence number.
+    pub seq: u32,
+}
+
+impl GateDriverSwitchTelemetry {
+    /// Decode a 16-byte contiguous register read starting at `REG_RDYSTAT` (`0x1B..=0x2A`)
+    /// using the scaling formulas from `bldc-custom/eicedriver/eicedriver.c`.
+    #[must_use]
+    pub fn from_status_bytes(
+        switch_id: GateDriverSwitch,
+        rx: &[u8; 16],
+        flt_n: bool,
+        rdyc: bool,
+        board_temp_c_x10: i16,
+        seq: u32,
+    ) -> Self {
+        let rdystat = rx[0];
+        Self {
+            switch_id,
+            configured: true,
+            i2c_ok: true,
+            flt_n,
+            rdyc,
+            chip_rdy: (rdystat & 0x01) != 0,
+            pri_rdy: ((rdystat >> 1) & 0x01) != 0,
+            sec_rdy: ((rdystat >> 2) & 0x01) != 0,
+            // rx[1] is 0x1C (unused gap between RDYSTAT and SECUVEVT)
+            secuvevt: rx[2],
+            gfltevt: rx[3],
+            fltevt: rx[4],
+            pinstat: rx[5],
+            comerrst: rx[6],
+            chipstat: rx[7],
+            evtstick: rx[8],
+            uv1fcnt: rx[9],
+            uv2fcnt: rx[10],
+            d2ecnt: rx[11],
+            adcmvdif: f32::from(rx[12]) / 6.6,
+            adcmgnd2: f32::from(rx[13]) / 6.6,
+            adcmvcc2: f32::from(rx[14]) / 6.6,
+            adcmtemp: f32::from(rx[15]) * 3.22 - 275.0,
+            board_temp_c_x10,
+            seq,
+        }
+    }
+
+    /// True when the switch is configured, I2C is healthy, all three ready bits
+    /// are asserted, and no fault pin or fault event register is active.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        self.configured
+            && self.i2c_ok
+            && self.flt_n
+            && self.rdyc
+            && self.chip_rdy
+            && self.pri_rdy
+            && self.sec_rdy
+            && self.fltevt == 0
+            && self.gfltevt == 0
+            && self.secuvevt == 0
+    }
+
+    /// True when a hardware fault pin is asserted or any fault/error event register is non-zero.
+    #[must_use]
+    pub const fn has_fault(&self) -> bool {
+        !self.configured
+            || !self.i2c_ok
+            || !self.flt_n
+            || !self.rdyc
+            || !self.chip_rdy
+            || !self.pri_rdy
+            || !self.sec_rdy
+            || self.fltevt != 0
+            || self.gfltevt != 0
+            || self.secuvevt != 0
+            || self.comerrst != 0
+    }
+}
+
+/// Aggregated snapshot of all 6 EiceDRIVER gate driver switches (`UH`..`WL`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GateDriverSnapshot {
+    /// Per-switch telemetry indexed by [`GateDriverSwitch::index`].
+    pub switches: [GateDriverSwitchTelemetry; GateDriverSwitch::COUNT],
+    /// Bitmask of switches that have received at least one telemetry frame (`1 << index`).
+    pub populated_mask: u8,
+    /// Latest gate driver PCB temperature in 0.1 °C units.
+    pub board_temp_c_x10: i16,
+    /// Latest sequence number received.
+    pub seq: u32,
+}
+
+impl Default for GateDriverSnapshot {
+    fn default() -> Self {
+        Self {
+            switches: [
+                GateDriverSwitchTelemetry {
+                    switch_id: GateDriverSwitch::Uh,
+                    ..GateDriverSwitchTelemetry::default()
+                },
+                GateDriverSwitchTelemetry {
+                    switch_id: GateDriverSwitch::Ul,
+                    ..GateDriverSwitchTelemetry::default()
+                },
+                GateDriverSwitchTelemetry {
+                    switch_id: GateDriverSwitch::Vh,
+                    ..GateDriverSwitchTelemetry::default()
+                },
+                GateDriverSwitchTelemetry {
+                    switch_id: GateDriverSwitch::Vl,
+                    ..GateDriverSwitchTelemetry::default()
+                },
+                GateDriverSwitchTelemetry {
+                    switch_id: GateDriverSwitch::Wh,
+                    ..GateDriverSwitchTelemetry::default()
+                },
+                GateDriverSwitchTelemetry {
+                    switch_id: GateDriverSwitch::Wl,
+                    ..GateDriverSwitchTelemetry::default()
+                },
+            ],
+            populated_mask: 0,
+            board_temp_c_x10: 0,
+            seq: 0,
+        }
+    }
+}
+
+impl GateDriverSnapshot {
+    /// Update the snapshot with a single switch's telemetry frame.
+    pub fn update(&mut self, telem: GateDriverSwitchTelemetry) {
+        let idx = telem.switch_id.index();
+        self.switches[idx] = telem;
+        self.populated_mask |= 1u8 << idx;
+        self.board_temp_c_x10 = telem.board_temp_c_x10;
+        self.seq = telem.seq;
+    }
+
+    /// Number of switches currently reporting `is_ready()`.
+    #[must_use]
+    pub fn ready_count(&self) -> usize {
+        self.switches.iter().filter(|s| s.is_ready()).count()
+    }
+
+    /// True if any populated switch reports a fault.
+    #[must_use]
+    pub fn any_fault(&self) -> bool {
+        self.switches
+            .iter()
+            .enumerate()
+            .any(|(idx, s)| (self.populated_mask & (1u8 << idx)) != 0 && s.has_fault())
+    }
+
+    /// Maximum die temperature (°C) across all populated switches with valid I2C reads.
+    #[must_use]
+    pub fn max_die_temp_c(&self) -> Option<f32> {
+        let mut max_temp: Option<f32> = None;
+        for (idx, s) in self.switches.iter().enumerate() {
+            if (self.populated_mask & (1u8 << idx)) != 0 && s.i2c_ok && s.adcmtemp.is_finite() {
+                max_temp = Some(match max_temp {
+                    Some(prev) if prev >= s.adcmtemp => prev,
+                    _ => s.adcmtemp,
+                });
+            }
+        }
+        max_temp
+    }
+}
+
 /// Response to a phase-source change request.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Schema)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

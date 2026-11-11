@@ -567,6 +567,99 @@ impl From<&crate::proto::oxifoc::FaultStateMessage<'_>> for FaultStateSnapshot {
     }
 }
 
+impl From<GateDriverSwitch> for crate::proto::oxifoc::GateDriverSwitch {
+    fn from(sw: GateDriverSwitch) -> Self {
+        match sw {
+            GateDriverSwitch::Uh => Self::Uh,
+            GateDriverSwitch::Ul => Self::Ul,
+            GateDriverSwitch::Vh => Self::Vh,
+            GateDriverSwitch::Vl => Self::Vl,
+            GateDriverSwitch::Wh => Self::Wh,
+            GateDriverSwitch::Wl => Self::Wl,
+        }
+    }
+}
+
+impl From<crate::proto::oxifoc::GateDriverSwitch> for GateDriverSwitch {
+    fn from(sw: crate::proto::oxifoc::GateDriverSwitch) -> Self {
+        match sw {
+            crate::proto::oxifoc::GateDriverSwitch::Uh => Self::Uh,
+            crate::proto::oxifoc::GateDriverSwitch::Ul => Self::Ul,
+            crate::proto::oxifoc::GateDriverSwitch::Vh => Self::Vh,
+            crate::proto::oxifoc::GateDriverSwitch::Vl => Self::Vl,
+            crate::proto::oxifoc::GateDriverSwitch::Wh => Self::Wh,
+            crate::proto::oxifoc::GateDriverSwitch::Wl => Self::Wl,
+        }
+    }
+}
+
+impl From<GateDriverSwitchTelemetry> for crate::proto::oxifoc::GateDriverTelemetryMessage<'static> {
+    fn from(t: GateDriverSwitchTelemetry) -> Self {
+        Self {
+            switch_id: EnumValue::Known(t.switch_id.into()),
+            configured: t.configured,
+            i2c_ok: t.i2c_ok,
+            flt_n: t.flt_n,
+            rdyc: t.rdyc,
+            chip_rdy: t.chip_rdy,
+            pri_rdy: t.pri_rdy,
+            sec_rdy: t.sec_rdy,
+            secuvevt: u32::from(t.secuvevt),
+            gfltevt: u32::from(t.gfltevt),
+            fltevt: u32::from(t.fltevt),
+            pinstat: u32::from(t.pinstat),
+            comerrst: u32::from(t.comerrst),
+            chipstat: u32::from(t.chipstat),
+            evtstick: u32::from(t.evtstick),
+            uv1fcnt: u32::from(t.uv1fcnt),
+            uv2fcnt: u32::from(t.uv2fcnt),
+            d2ecnt: u32::from(t.d2ecnt),
+            adcmvdif: t.adcmvdif,
+            adcmgnd2: t.adcmgnd2,
+            adcmvcc2: t.adcmvcc2,
+            adcmtemp: t.adcmtemp,
+            board_temp_c_x10: i32::from(t.board_temp_c_x10),
+            seq: t.seq,
+            unknown_fields: UnknownFields::empty(),
+        }
+    }
+}
+
+impl From<&crate::proto::oxifoc::GateDriverTelemetryMessage<'_>> for GateDriverSwitchTelemetry {
+    fn from(m: &crate::proto::oxifoc::GateDriverTelemetryMessage<'_>) -> Self {
+        let switch_id = match m.switch_id {
+            EnumValue::Known(s) => s.into(),
+            EnumValue::Unknown(_) => GateDriverSwitch::Uh,
+        };
+        Self {
+            switch_id,
+            configured: m.configured,
+            i2c_ok: m.i2c_ok,
+            flt_n: m.flt_n,
+            rdyc: m.rdyc,
+            chip_rdy: m.chip_rdy,
+            pri_rdy: m.pri_rdy,
+            sec_rdy: m.sec_rdy,
+            secuvevt: m.secuvevt as u8,
+            gfltevt: m.gfltevt as u8,
+            fltevt: m.fltevt as u8,
+            pinstat: m.pinstat as u8,
+            comerrst: m.comerrst as u8,
+            chipstat: m.chipstat as u8,
+            evtstick: m.evtstick as u8,
+            uv1fcnt: m.uv1fcnt as u8,
+            uv2fcnt: m.uv2fcnt as u8,
+            d2ecnt: m.d2ecnt as u8,
+            adcmvdif: m.adcmvdif,
+            adcmgnd2: m.adcmgnd2,
+            adcmvcc2: m.adcmvcc2,
+            adcmtemp: m.adcmtemp,
+            board_temp_c_x10: m.board_temp_c_x10 as i16,
+            seq: m.seq,
+        }
+    }
+}
+
 impl From<MotorRequest> for crate::proto::oxifoc::MotorCommandRequest<'static> {
     fn from(req: MotorRequest) -> Self {
         match req.command {

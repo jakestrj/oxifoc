@@ -21,7 +21,7 @@ use crate::icd::FaultStateSnapshot;
 use crate::state::{MotorControlState, update_telemetry};
 use crate::timer::Timer;
 pub use crate::types::FAST_BATCH_SAMPLES;
-use crate::types::{FastTelemetry, SlowTelemetry};
+use crate::types::{FastTelemetry, GateDriverSwitchTelemetry, SlowTelemetry};
 
 /// Number of Watch consumers supported per telemetry channel.
 pub const NUM_CONSUMERS: usize = 2;
@@ -37,6 +37,18 @@ pub static FAST_TELEMETRY_WATCH: Watch<CriticalSectionRawMutex, FastTelemetry, N
 /// Watch channel for active fault state updates.
 pub static FAULT_STATE_WATCH: Watch<CriticalSectionRawMutex, FaultStateSnapshot, NUM_CONSUMERS> =
     Watch::new();
+
+/// Watch channel for per-switch gate driver telemetry updates.
+pub static GATE_DRIVER_TELEMETRY_WATCH: Watch<
+    CriticalSectionRawMutex,
+    GateDriverSwitchTelemetry,
+    NUM_CONSUMERS,
+> = Watch::new();
+
+/// Publish a single switch's gate driver telemetry snapshot to [`GATE_DRIVER_TELEMETRY_WATCH`].
+pub fn publish_gate_driver_telemetry(telem: GateDriverSwitchTelemetry) {
+    GATE_DRIVER_TELEMETRY_WATCH.sender().send(telem);
+}
 
 /// Lock-free queue for ISR → async telemetry transfer.
 #[cfg(feature = "std")]
