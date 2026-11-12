@@ -189,6 +189,4 @@ pub const CPU_HZ: u32 = 168_000_000;
 // Protocol Configuration (CAN + NMEA + streaming-protocol)
 // ============================================================================
 
-pub use oxifoc_core::icd::{
-    CAN_BITRATE, NMEA_INTER_FRAME_DELAY_MS, NMEA_RX_ARBITRATION_ID, NMEA_TX_ARBITRATION_ID,
-};
+pub use oxifoc_core::icd::{CAN_BITRATE, NMEA_RX_ARBITRATION_ID, NMEA_TX_ARBITRATION_ID};

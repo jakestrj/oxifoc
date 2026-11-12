@@ -9,14 +9,10 @@ use embassy_stm32::can::{
     CanConfigurator, CanRx, CanTx, Frame, IT0InterruptHandler, IT1InterruptHandler,
 };
 use embassy_stm32::peripherals::FDCAN1;
-use embassy_time::Timer;
 use nmea::nmea_message::Message as NmeaMessage;
 use oxifoc_core::runtime::{CommsError, MessageSender, NmeaCanReceiver, send_messages};
 
-use crate::config::{
-    CAN_BITRATE, NMEA_INTER_FRAME_DELAY_MS, NMEA_RX_ARBITRATION_ID, NMEA_TX_ARBITRATION_ID,
-    PWM_CONFIG,
-};
+use crate::config::{CAN_BITRATE, NMEA_RX_ARBITRATION_ID, NMEA_TX_ARBITRATION_ID, PWM_CONFIG};
 use crate::hardware::CanResources;
 use crate::protocol::{DeviceState, set_device_state};
 use crate::{FAULT_REGISTRY, STATE};
@@ -40,7 +36,6 @@ impl MessageSender for CanTxSender<'_> {
                 return Err(CommsError::CanError);
             };
             self.can_tx.write(&frame).await;
-            Timer::after_millis(NMEA_INTER_FRAME_DELAY_MS).await;
         }
         Ok(())
     }

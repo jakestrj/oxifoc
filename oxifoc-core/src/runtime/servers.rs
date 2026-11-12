@@ -158,6 +158,7 @@ pub fn process_wire_message<F: PlatformFault>(
     };
 
     // Any valid incoming request marks the communication link active.
+    cmd_stats::LINK_RX_REQS.fetch_add(1, Ordering::Relaxed);
     critical_section::with(|cs| {
         state_mutex.borrow(cs).borrow_mut().set_link_active();
     });

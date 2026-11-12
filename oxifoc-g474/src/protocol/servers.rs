@@ -44,15 +44,15 @@ pub async fn liveness_task() {
 
     let mut ticker = Ticker::every(Duration::from_millis(100));
     let mut last_cmd_instant = Instant::now();
-    let mut prev_reqs: u32 = 0;
+    let mut prev_rx: u32 = 0;
     let mut stats_ticks: u8 = 0;
 
     loop {
         ticker.next().await;
 
-        let cur_reqs = cs::MOTOR_REQS.load(Ordering::Relaxed);
-        if cur_reqs != prev_reqs {
-            prev_reqs = cur_reqs;
+        let cur_rx = cs::LINK_RX_REQS.load(Ordering::Relaxed);
+        if cur_rx != prev_rx {
+            prev_rx = cur_rx;
             last_cmd_instant = Instant::now();
         }
 

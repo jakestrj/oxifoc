@@ -85,6 +85,9 @@ pub mod fast_telem_stats {
 /// device stats task.
 pub mod cmd_stats {
     use core::sync::atomic::AtomicU32;
+    /// Total valid incoming `WireMessage` requests received from the host
+    /// (monotonic counter used by `liveness_task` to track host link activity).
+    pub static LINK_RX_REQS: AtomicU32 = AtomicU32::new(0);
     /// Motor command requests received by the command handler.
     pub static MOTOR_REQS: AtomicU32 = AtomicU32::new(0);
     /// `DriverCommand::SetMode` drained by the ISR (deadman stamp events).
@@ -314,6 +317,10 @@ pub async fn slow_telemetry_stream<F: PlatformFault, T: Timer>(
 }
 
 /// Drain `FAST_TELEM_Q` and publish [`FastTelemetry`] samples to [`FAST_TELEMETRY_WATCH`].
+///
+/// Publishes at most one sample per wakeup so [`FAST_TELEMETRY_WATCH`] (depth 1)
+/// is not overwritten in a synchronous loop when multiple samples queue up while
+/// `send_messages` is busy transmitting another telemetry packet.
 pub async fn fast_telemetry_stream<T: Timer>(foc_freq_hz: u32) {
     let cons = FAST_TELEM_Q.framed_consumer();
     let sender = FAST_TELEMETRY_WATCH.sender();
@@ -332,17 +339,30 @@ pub async fn fast_telemetry_stream<T: Timer>(foc_freq_hz: u32) {
             100_000
         };
 
-        T::after_micros(interval_us).await;
-
+        let mut published = false;
         while let Ok(grant) = cons.read() {
             if grant.len() == size_of::<FastTelemetry>() {
                 let sample: FastTelemetry = bytemuck::pod_read_unaligned(&grant);
                 fast_telem_stats::READ_OK.fetch_add(1, Ordering::Relaxed);
                 sender.send(sample);
-            } else {
-                fast_telem_stats::READ_BADLEN.fetch_add(1, Ordering::Relaxed);
+                grant.release();
+                published = true;
+                break;
             }
+            fast_telem_stats::READ_BADLEN.fetch_add(1, Ordering::Relaxed);
             grant.release();
+        }
+
+        if published {
+            // Pace consecutive publications at half the sample period (clamped to
+            // 200..=2_000 us) so `send_messages` gets an async wakeup to transmit
+            // each sample before the next queued sample is published, while still
+            // draining bursts at >=2x the producer rate.
+            let step_us = (interval_us / 2).clamp(200, 2_000);
+            T::after_micros(step_us).await;
+        } else {
+            let poll_us = (interval_us / 10).clamp(200, 1_000);
+            T::after_micros(poll_us).await;
         }
     }
 }
